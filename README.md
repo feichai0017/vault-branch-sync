@@ -39,3 +39,13 @@ npm run build
 ```
 
 The build writes `main.js` beside `manifest.json`. The tests use disposable folders and synthetic vault files. They cover interrupted downloads, empty repositories, concurrent pushes, delete/edit conflicts, branch selection and file exclusions. [MIT license](LICENSE) · [node-ignore, included under MIT](https://github.com/kaelzhang/node-ignore)
+
+## Verify a release
+
+Download `main.js` from the release you want to install, then run this command in its folder with the GitHub CLI.
+
+```sh
+gh attestation verify main.js --repo feichai0017/vault-branch-sync --signer-workflow feichai0017/vault-branch-sync/.github/workflows/release-provenance.yml --deny-self-hosted-runners
+```
+
+Publish each GitHub release with `main.js` and `manifest.json` attached. GitHub Actions rebuilds the tagged source, runs the tests, and signs the SHA-256 digest only if the build matches the published `main.js` byte for byte. To backfill a published release, run **Release provenance** from the Actions tab and enter its tag. The signed record includes the source commit used for the rebuild. [Release workflow](.github/workflows/release-provenance.yml)

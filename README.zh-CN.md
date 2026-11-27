@@ -21,3 +21,13 @@
 - 按需开启 **同步常用设置与主题**，可以一起同步外观、快捷键、主题和 CSS 片段。两端的配置目录名需要相同，接收后重新打开库即可加载外观。
 - 插件程序、启用列表、工作区布局、Git 元数据和令牌由每台设备各自管理。建议一个文件夹使用一种同步方式。插件会读写 Obsidian 管理的库文件，本地 Git 客户端自行维护暂存区和本地分支。
 - 连接与同步时，插件直接请求 GitHub。令牌存在本机的 Obsidian 密钥存储中。代码和发布包使用 MIT 许可证。[英文说明与构建命令](README.md)
+
+## 验证发布包
+
+从要安装的 GitHub Release 下载 `main.js`，在文件所在目录用 GitHub CLI 验证签名。
+
+```sh
+gh attestation verify main.js --repo feichai0017/vault-branch-sync --signer-workflow feichai0017/vault-branch-sync/.github/workflows/release-provenance.yml --deny-self-hosted-runners
+```
+
+发版时，把 `main.js` 和 `manifest.json` 一起附在 GitHub Release 里。发布后，GitHub Actions 自动检出对应标签、运行测试并重新构建。只有构建产物和发布的 `main.js` 逐字节一致，才会为它的 SHA-256 摘要签发证明。要给旧版本补签，可以在 Actions 的 **Release provenance** 里填写已发布的标签。签名记录里可以查到重建使用的源码提交。[发版工作流](.github/workflows/release-provenance.yml)
