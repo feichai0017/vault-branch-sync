@@ -7,7 +7,7 @@
 1. 使用 Obsidian 1.11.4 或更新版本。在社区插件里启用 **Vault Branch Sync**。手动安装时，把同一发行版的 `main.js` 和 `manifest.json` 放入库内的 `.obsidian/plugins/vault-branch-sync/`，重新打开 Obsidian。[GitHub 安装包](https://github.com/feichai0017/vault-branch-sync/releases/latest)
 2. 为笔记准备一个 GitHub **私有**仓库。打开 **设置 → Vault Branch Sync**，填入 `用户名/仓库名`。分支留空会采用仓库的默认分支，其他分支需先在 GitHub 创建。
 3. 在 GitHub 创建细粒度令牌，选择 **Only select repositories**，只勾选自己的笔记仓库，把 **Contents** 设为 **Read and write**。在插件里粘贴令牌，点 **保存连接**。每台设备单独设置一次。[GitHub 官方说明](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)
-4. 点 **仅接收**。首次下载时，本机独有的草稿留在本机。如果远端是空仓库，在已经有笔记的那台设备再点 **预览同步改动**，勾选要首次上传的文件。
+4. 点 **仅接收**。首次下载时，本机独有的草稿留在本机。如果远端是空仓库，在已经有笔记的那台设备再点 **预览同步改动**，勾选要首次上传的文件。空仓库的首次上传会先用一个已选文件建立分支，其余已选文件进入第二个提交。
 
 ## 平时怎么用
 
