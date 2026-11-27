@@ -1,12 +1,15 @@
-import {Modal, Notice, Plugin, PluginSettingTab, Setting, TextFileView, TFolder, arrayBufferToBase64, getLanguage, requestUrl} from "obsidian";
+import {Notice, Platform, Plugin, PluginSettingTab, Setting, TextFileView, TFolder, arrayBufferToBase64, getLanguage, requestUrl} from "obsidian";
+import {compareNote} from "./compare.js";
+import {SyncReview, t} from "./review.js";
 import {HeadMoved, synchronize} from "./engine.js";
 import {GitHub} from "./github.js";
 import {branchName, fileScope, repositoryName, sameTarget} from "./target.js";
 
 const connectionKey = "vault-branch-sync.connection.v1";
 const baselineKey = "vault-branch-sync.baseline.v1";
+const autoKey = "vault-branch-sync.auto-receive";
+const statusKey = "vault-branch-sync.last-sync";
 const tokenPage = "https://github.com/settings/personal-access-tokens/new?name=Vault%20Branch%20Sync&contents=write";
-const t = (en, zh) => getLanguage().startsWith("zh") ? zh : en;
 
 function vaultFiles(app, scope) {
     const vault = app.vault, disk = vault.adapter;
@@ -42,24 +45,6 @@ function vaultFiles(app, scope) {
     };
 }
 
-class Conflicts extends Modal {
-    constructor(app, changes, resolve) { super(app); this.changes = changes; this.resolve = resolve; }
-    onOpen() {
-        this.setTitle(t("Keep both versions?", "保留两边的版本？"));
-        this.contentEl.createEl("p", {text: t(
-            "The following files changed on both sides. Keep both saves your local version in “Sync conflicts” and applies the GitHub version at the original path. A remote deletion moves the original to the vault trash.",
-            "以下文件在两边都有改动。选择「保留两份」会把本机版本存入「Sync conflicts」，原路径采用 GitHub 版本。GitHub 已删除的原文件会移入本机废纸篓。")});
-        const list = this.contentEl.createEl("ul");
-        for (const {path} of this.changes) list.createEl("li", {text: path});
-        new Setting(this.contentEl)
-            .addButton(button => button.setButtonText(t("Cancel", "取消")).onClick(() => this.close()))
-            .addButton(button => button.setButtonText(t("Keep both", "保留两份")).setCta().onClick(() => {
-                this.resolve(true); this.close();
-            }));
-    }
-    onClose() { this.resolve(false); this.contentEl.empty(); }
-}
-
 class Settings extends PluginSettingTab {
     constructor(app, plugin) { super(app, plugin); this.plugin = plugin; }
     display() {
@@ -72,7 +57,7 @@ class Settings extends PluginSettingTab {
         new Setting(el).setName(t("Branch", "分支"))
             .setDesc(t("Leave blank to use the repository's default branch.", "留空时使用仓库默认分支。"))
             .addText(input => {branchInput = input; input.setPlaceholder(t("Default branch", "默认分支")).setValue(current?.branch || "");});
-        const desc = document.createDocumentFragment();
+        const desc = el.ownerDocument.createDocumentFragment();
         desc.appendText(t("Choose only your vault repository and grant Contents read and write. ", "只选择自己的笔记仓库，授予 Contents 读写权限。"));
         desc.createEl("a", {text: t("Create a fine-grained token on GitHub", "到 GitHub 创建细粒度令牌"), href: tokenPage});
         new Setting(el).setName(t("GitHub token", "GitHub 令牌")).setDesc(desc)
@@ -86,8 +71,8 @@ class Settings extends PluginSettingTab {
                 "同时同步外观、快捷键、主题和 CSS 片段。接收后重新打开库即可加载外观。"))
             .addToggle(toggle => toggle.setValue(share).onChange(value => { share = value; }));
         new Setting(el).setName(t("Connect this device", "连接本设备"))
-            .setDesc(t("A new repository, branch or file scope starts with a download. After that, Sync can upload existing files in this vault.",
-                "更换仓库、分支或同步范围后首次只接收。之后点击同步会上传本库中有改动的文件。"))
+            .setDesc(t("A new connection starts with a download. Later you can choose which files to commit.",
+                "新连接首次只接收，之后可以选择要提交的文件。"))
             .addButton(button => button.setButtonText(t("Save connection", "保存连接")).setCta().onClick(async () => {
                 if (plugin.busy) return;
                 button.setDisabled(true);
@@ -98,20 +83,89 @@ class Settings extends PluginSettingTab {
                 } catch (error) { new Notice(error.message, 10000); }
                 finally {button.setDisabled(false);}
             }));
+        new Setting(el).setName(t("Receive when opening or returning to this vault", "打开笔记库或回到前台时自动接收"))
+            .setDesc(t("On this device, download GitHub changes and leave conflicts for review. Uploads are always manual.",
+                "此设备会自动接收 GitHub 更新，遇到冲突留待你选择。上传仍由你手动发起。"))
+            .addToggle(toggle => toggle.setValue(plugin.autoEnabled()).onChange(value => {
+                this.app.saveLocalStorage(autoKey, value);
+                plugin.scheduleReceive();
+            }));
+        this.statusSetting = new Setting(el).setName(t("Sync status on this device", "本设备同步状态"));
+        plugin.refreshStatus();
         new Setting(el).setName(t("Sync vault", "同步笔记"))
-            .setDesc(t("Receive remote changes and send local edits in a Git commit.", "接收远端更新，并把本机改动提交到 GitHub。"))
-            .addButton(b => b.setButtonText(t("Sync now", "立即同步")).onClick(() => plugin.run(true)))
+            .setDesc(t("Review incoming changes and choose the local files to commit together.", "预览待接收的改动，并勾选本次一起提交的文件。"))
+            .addButton(b => b.setButtonText(t("Review changes", "预览同步改动")).onClick(() => plugin.run(true)))
             .addButton(b => b.setButtonText(t("Receive changes", "仅接收")).onClick(() => plugin.run(false)));
     }
+
+    hide() { this.statusSetting = null; }
 }
 
 export default class VaultBranchSync extends Plugin {
     onload() {
         this.busy = false;
-        this.addSettingTab(new Settings(this.app, this));
+        this.active = true;
+        this.ready = false;
+        this.settingsTab = new Settings(this.app, this);
+        this.addSettingTab(this.settingsTab);
+        if (!Platform.isMobile) this.statusBar = this.addStatusBarItem();
+        this.refreshStatus();
         this.addRibbonIcon("refresh-cw", t("Sync vault with GitHub", "同步笔记到 GitHub"), () => this.run(true));
         this.addCommand({id: "sync", name: t("Sync with GitHub", "与 GitHub 同步"), callback: () => this.run(true)});
         this.addCommand({id: "receive", name: t("Receive changes from GitHub", "仅接收 GitHub 更新"), callback: () => this.run(false)});
+        this.addCommand({id: "show-status", name: t("Show sync status", "查看同步状态"), callback: () => new Notice(this.statusText(), 8000)});
+        this.app.workspace.onLayoutReady(() => {
+            if (!this.active) return;
+            this.doc = this.app.workspace.containerEl.ownerDocument;
+            this.win = this.doc.defaultView;
+            this.ready = true;
+            this.registerDomEvent(this.doc, "visibilitychange", () => this.scheduleReceive());
+            this.registerDomEvent(this.win, "focus", () => this.scheduleReceive());
+            this.scheduleReceive();
+        });
+    }
+
+    onunload() {
+        this.active = false;
+        this.win?.clearTimeout(this.autoTimer);
+        this.reviewModal?.close();
+    }
+
+    autoEnabled() { return this.app.loadLocalStorage(autoKey) === true; }
+
+    scheduleReceive() {
+        if (!this.ready || !this.active) return;
+        this.win.clearTimeout(this.autoTimer);
+        if (this.doc.hidden || this.busy || !this.autoEnabled() || !this.connection()) return;
+        // iOS can signal both visibility and focus for the same foreground transition.
+        this.autoTimer = this.win.setTimeout(() => {
+            if (this.active && !this.doc.hidden && !this.busy && this.autoEnabled()) void this.run(false, true);
+        }, 300);
+    }
+
+    statusText() {
+        const status = this.app.loadLocalStorage(statusKey);
+        let text = status?.lastSuccess
+            ? t("Last successful sync", "上次成功同步") + " · " + new Date(status.lastSuccess).toLocaleString(getLanguage())
+            : t("No successful sync on this device yet.", "本设备还没有成功同步记录。");
+        if (status) {
+            text += t(" | Last check: received ", " | 上次检查接收 ") + status.received + t(", committed ", "，提交 ") + status.sent;
+            if (status.deferred) text += t(", conflicts to review ", "，待处理冲突 ") + status.deferred;
+        }
+        if (this.lastError) text += " | " + this.lastError;
+        return text;
+    }
+
+    refreshStatus() {
+        const text = this.statusText();
+        this.settingsTab?.statusSetting?.setDesc(text);
+        if (this.statusBar) {
+            const status = this.app.loadLocalStorage(statusKey);
+            const time = status?.lastSuccess ? new Date(status.lastSuccess).toLocaleTimeString(getLanguage(), {hour: "2-digit", minute: "2-digit"}) : "—";
+            this.statusBar.setText(this.connection() ? "GitHub · " + time + (status?.deferred || this.lastError ? " ⚠" : "") : "");
+            this.statusBar.setAttribute("aria-label", text);
+            this.statusBar.title = text;
+        }
     }
 
     connection() { return this.app.loadLocalStorage(connectionKey); }
@@ -140,15 +194,27 @@ export default class VaultBranchSync extends Plugin {
             const secretId = previous?.secretId || "vault-branch-sync-" + crypto.randomUUID();
             this.app.secretStorage.setSecret(secretId, token);
             this.app.saveLocalStorage(connectionKey, {...target, secretId, settings});
-            if (!sameTarget(previous, target) || previous?.settings !== settings) this.app.saveLocalStorage(baselineKey, null);
+            if (!sameTarget(previous, target) || previous?.settings !== settings) {
+                this.app.saveLocalStorage(baselineKey, null);
+                this.app.saveLocalStorage(statusKey, null);
+            }
+            this.lastError = null;
+            this.refreshStatus();
         } finally {this.busy = false;}
+        this.scheduleReceive();
     }
 
-    async run(send) {
-        if (this.busy) {new Notice(t("A sync or connection check is already running.", "正在同步或检查连接。")); return;}
+    async run(send, automatic = false) {
+        if (this.busy || !this.active) {
+            if (!automatic && this.active) new Notice(t("A sync or connection check is already running.", "正在同步或检查连接。"));
+            return;
+        }
         const connection = this.connection();
-        if (!connection) {new Notice(t("Open Settings → Vault Branch Sync to connect a private GitHub repository.",
-            "请先在「设置 → Vault Branch Sync」连接自己的 GitHub 私有仓库。"), 9000); return;}
+        if (!connection) {
+            if (!automatic) new Notice(t("Open Settings → Vault Branch Sync to connect a private GitHub repository.",
+                "请先在「设置 → Vault Branch Sync」连接自己的 GitHub 私有仓库。"), 9000);
+            return;
+        }
         this.busy = true;
         let notice;
         try {
@@ -157,25 +223,54 @@ export default class VaultBranchSync extends Plugin {
             const target = {repository: connection.repository, branch: connection.branch};
             const scope = fileScope(connection.settings, this.app.vault.configDir);
             const api = this.client(target, token, scope), adapter = vaultFiles(this.app, scope);
-            notice = new Notice(t("Reading branch…", "正在读取分支…"), 0);
+            if (!automatic) notice = new Notice(t("Reading branch…", "正在读取分支…"), 0);
+            const review = plan => {
+                if (!this.active) return null;
+                if (automatic) return {selected: new Set(), conflicts: new Map()};
+                return new Promise(resolve => {
+                    this.reviewModal = new SyncReview(this.app, plan,
+                        change => compareNote(change, adapter, api, plan.remoteSize(change.path)),
+                        result => { this.reviewModal = null; resolve(result); });
+                    this.reviewModal.open();
+                });
+            };
             for (let attempt = 0; attempt < 2; attempt++) {
                 try {
-                    const result = await synchronize({adapter, api, scope, target, send,
-                        state: this.app.loadLocalStorage(baselineKey), save: state => this.app.saveLocalStorage(baselineKey, state),
-                        confirm: changes => new Promise(resolve => new Conflicts(this.app, changes, resolve).open()),
-                        progress: message => notice.setMessage(message)
+                    const result = await synchronize({adapter, api, scope, target, send: send && !automatic, fastReceive: automatic, review,
+                        state: this.app.loadLocalStorage(baselineKey), save: value => this.app.saveLocalStorage(baselineKey, value),
+                        progress: message => notice?.setMessage(message)
                     });
-                    if (result.canceled) {new Notice(t("Sync canceled.", "已取消同步。")); return;}
-                    const prefix = result.first ? t("First download complete", "首次接收完成") : t("Sync complete", "同步完成");
-                    new Notice(prefix + t(" · Received ", " · 接收 ") + result.received + t(", sent ", "，提交 ") + result.sent +
-                        (result.copies ? t(". Local copies are in Sync conflicts.", "。本地副本在 Sync conflicts。") : ""), 8000);
+                    if (result.canceled) {
+                        if (this.active && !automatic) new Notice(t("Sync canceled.", "已取消同步。"));
+                        return;
+                    }
+                    const previous = this.app.loadLocalStorage(statusKey);
+                    const {received, sent, deferred} = result;
+                    this.app.saveLocalStorage(statusKey, {
+                        lastSuccess: deferred ? previous?.lastSuccess ?? null : Date.now(), received, sent, deferred
+                    });
+                    this.lastError = null;
+                    this.refreshStatus();
+                    if (this.active && (!automatic || received || (deferred && deferred !== previous?.deferred))) {
+                        let message = result.first ? t("First download complete", "首次接收完成") : t("Sync finished", "同步完成");
+                        message += t(" · Received ", " · 接收 ") + received + t(", committed ", "，提交 ") + sent;
+                        if (deferred) message += t(" · Review conflicts: ", " · 待处理冲突 ") + deferred;
+                        if (result.copies) message += t(" · Local copies in Sync conflicts", " · 本机副本已存入 Sync conflicts");
+                        new Notice(message, 8000);
+                    }
                     return;
                 } catch (error) {
-                    if (!(error instanceof HeadMoved) || attempt) throw error;
-                    notice.setMessage(t("Another device pushed. Comparing again…", "另一台设备刚刚推送，正在重新比较…"));
+                    if (!(error instanceof HeadMoved) || attempt || !this.active) throw error;
+                    notice?.setMessage(t("Another device pushed. Comparing again…", "另一台设备刚刚推送，正在重新比较…"));
                 }
             }
-        } catch (error) {new Notice(error.message, 10000);}
-        finally {notice?.hide(); this.busy = false;}
+        } catch (error) {
+            this.lastError = error.message;
+            this.refreshStatus();
+            if (this.active && !automatic) new Notice(error.message, 10000);
+        } finally {
+            notice?.hide();
+            this.busy = false;
+        }
     }
 }

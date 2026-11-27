@@ -232,3 +232,151 @@ test("selecting the default branch handles empty repositories and escapes nested
     assert.equal(snap.head, null); assert.equal(api.branch, "team/draft#1");
     assert(requests.includes("https://api.github.com/repos/example/notes/git/ref/heads/team/draft%231"));
 });
+
+const choose = (paths = [], conflicts = []) => ({selected: new Set(paths), conflicts: new Map(conflicts)});
+
+test("review commits only the chosen note, index and image and still receives other changes", async t => {
+    const [r, mac, phone] = await setup(t, 2);
+    r.set("Index.md", "old"); r.set("Archive.md", "keep"); r.set("Updates.md", "old");
+    await mac.sync(r); await phone.sync(r);
+    await mac.file("Paper.md", "new"); await mac.file("Index.md", "with paper");
+    await mac.file("Attachments/figure.png", Buffer.from([0, 255]));
+    await mac.file("Personal/draft.md", "private draft"); await mac.adapter.trashLocal("Archive.md");
+    r.set("Updates.md", "from phone");
+    const selected = ["Paper.md", "Index.md", "Attachments/figure.png"];
+    const writes = [];
+    const upload = r.putBlob.bind(r);
+    r.putBlob = async (bytes, sha) => { writes.push(sha); return upload(bytes, sha); };
+    const before = r.revision;
+    const result = await mac.sync(r, {review: plan => {
+        assert(plan.canSend);
+        assert.deepEqual(plan.incoming.map(c => c.path), ["Updates.md"]);
+        assert.equal(plan.outgoing.find(c => c.path === "Archive.md").here, undefined);
+        return choose(selected);
+    }});
+    assert.equal(r.revision, before + 1);
+    assert.equal(result.sent, 3); assert.equal(result.pending, 2); assert.equal(result.received, 1);
+    assert(!writes.includes(oid("private draft"))); assert(!r.files.has("Personal/draft.md"));
+    assert(r.files.has("Archive.md")); assert.equal(await mac.text("Updates.md"), "from phone");
+    await phone.sync(r, {send: false});
+    assert.equal(await phone.text("Paper.md"), "new");
+    const next = await mac.sync(r, {review: plan => {
+        assert.deepEqual(plan.outgoing.map(x => x.path).sort(), ["Archive.md", "Personal/draft.md"]);
+        return choose(["Archive.md"]);
+    }});
+    assert.equal(next.sent, 1); assert(!r.files.has("Archive.md")); assert(!r.files.has("Personal/draft.md"));
+});
+
+test("canceling the preview or selecting nothing does not publish local changes", async t => {
+    const [r, d] = await setup(t);
+    r.set("remote.md", "before"); await d.sync(r);
+    r.set("remote.md", "after"); await d.file("local.md", "mine");
+    const start = r.revision;
+    assert((await d.sync(r, {review: () => null})).canceled);
+    assert.equal(await d.text("remote.md"), "before");
+    assert.equal((await d.sync(r, {review: () => choose()})).sent, 0);
+    assert.equal(await d.text("remote.md"), "after"); assert.equal(start, r.revision);
+});
+
+test("an empty repository continues only with approved paths and approved bytes", async t => {
+    const [r, d] = await setup(t);
+    const existingHead = r.head.bind(r);
+    r.head = () => r.files.size ? existingHead() : Promise.resolve(null);
+    r.initialize = async (path, bytes) => {
+        r.set(path, Buffer.from(bytes)); await d.file("late.md", "arrived after approval"); return r.head();
+    };
+    for (const name of ["a.md", "b.md", "draft.md"]) await d.file(name, name);
+    await d.sync(r);
+    let previews = 0;
+    const result = await d.sync(r, {review: () => { previews++; return choose(["a.md", "b.md"]); }});
+    assert.equal(result.sent, 2); assert.equal(previews, 1);
+    assert.deepEqual([...r.files.keys()].sort(), ["a.md", "b.md"]);
+});
+
+test("per-file conflict choices support either version, both copies, and postponement across receives", async t => {
+    const [r, d] = await setup(t);
+    for (const path of ["local.md", "remote.md", "image.png", "later.md", "delete.md"]) r.set(path, "base");
+    await d.sync(r);
+    for (const path of r.files.keys()) { r.set(path, "remote"); await d.file(path, "local"); }
+    await d.adapter.trashLocal("delete.md");
+    await d.file("new-on-both.md", "local new"); r.set("new-on-both.md", "remote new");
+    const result = await d.sync(r, {review: plan => {
+        assert.equal(plan.conflicts.length, 6);
+        return choose([], [["local.md","local"], ["delete.md","local"], ["remote.md","remote"], ["image.png","both"]]);
+    }});
+    assert.equal(result.sent, 2); assert.equal(result.copies, 1); assert.equal(result.deferred, 2);
+    assert.equal(r.files.get("local.md"), oid("local")); assert(!r.files.has("delete.md"));
+    assert.equal(await d.text("remote.md"), "remote"); assert.equal(await d.text("image.png"), "remote");
+    assert.equal(await d.text((await d.adapter.list("Sync conflicts")).files[0]), "local");
+    assert.equal(await d.text("later.md"), "local"); assert.equal(r.files.get("later.md"), oid("remote"));
+    r.set("another.md", "separate change");
+    const head = await r.head();
+    const auto = await d.sync(r, {send: false, review: plan => {
+        assert(!plan.canSend); assert.deepEqual(plan.outgoing, []);
+        assert.deepEqual(plan.conflicts.map(x => x.path).sort(), ["later.md", "new-on-both.md"]);
+        return choose();
+    }});
+    assert.equal(auto.deferred, 2); assert.equal(auto.received, 1); assert.equal(await r.head(), head);
+    const again = await d.sync(r, {review: plan => {
+        assert.equal(plan.conflicts.length, 2); return choose([], [["new-on-both.md", "remote"]]);
+    }});
+    assert.equal(again.deferred, 1); assert.equal(await d.text("new-on-both.md"), "remote new");
+});
+
+test("an automatic first receive defers collisions without uploading, and cannot commit a local resolution", async t => {
+    const [r, d] = await setup(t);
+    await d.file("conflict.md", "draft"); r.set("conflict.md", "other"); r.set("incoming.md", "receive");
+    const head = await r.head();
+    const result = await d.sync(r, {send: false, review: () => choose()});
+    assert(result.first); assert.equal(result.deferred, 1); assert.equal(await d.text("conflict.md"), "draft");
+    assert.equal(await d.text("incoming.md"), "receive");
+    await assert.rejects(d.sync(r, {send: false, review: () => choose([], [["conflict.md", "local"]])}), /Invalid conflict decision/);
+    assert.equal(await r.head(), head); assert.equal(r.files.get("conflict.md"), oid("other"));
+    const kept = await d.sync(r, {send:false, review:() => choose([], [["conflict.md", "keep-local"]])});
+    assert.equal(kept.deferred, 0); assert.equal(kept.sent, 0); assert.equal(await r.head(), head);
+    assert.equal(await d.text("conflict.md"), "draft");
+    await d.sync(r, {review:plan => {
+        assert.equal(plan.conflicts.length, 0); assert.deepEqual(plan.outgoing.map(c => c.path), ["conflict.md"]);
+        return choose(["conflict.md"]);
+    }});
+    assert.equal(r.files.get("conflict.md"), oid("draft"));
+});
+
+test("a moving head or edited selection invalidates the user's preview before publishing", async t => {
+    const [r, d] = await setup(t);
+    r.set("shared.md", "old"); await d.sync(r); await d.file("note.md", "selected");
+    r.set("shared.md", "one");
+    await assert.rejects(d.sync(r, {review: () => {
+        r.set("shared.md", "two"); return choose(["note.md"]);
+    }}), HeadMoved);
+    assert.equal(await d.text("shared.md"), "old"); assert(!r.files.has("note.md"));
+    await assert.rejects(d.sync(r, {review: async () => {
+        await d.file("note.md", "edited while previewing"); return choose(["note.md"]);
+    }}), /Edited during upload/);
+    assert.equal(await d.text("note.md"), "edited while previewing"); assert(!r.files.has("note.md"));
+});
+
+test("foreground checks skip file reads only for a completely received unchanged revision", async t => {
+    const [r, d] = await setup(t);
+    const snapshot = r.snapshot.bind(r);
+    const hints = [];
+    r.snapshot = async known => {
+        hints.push(known);
+        return known && known === await r.head() ? {unchanged:true,head:known} : snapshot();
+    };
+    r.set("note.md", "old");
+    const auto = {send:false, fastReceive:true, review:() => choose()};
+    await d.sync(r, auto);
+    const list = d.adapter.list;
+    d.adapter.list = () => { throw Error("Unnecessary vault scan"); };
+    assert.equal((await d.sync(r, auto)).received, 0); assert.equal(hints.at(-1), await r.head());
+    d.adapter.list = list;
+    await d.file("note.md", "local"); r.set("note.md", "remote");
+    assert.equal((await d.sync(r, auto)).deferred, 1);
+    assert.equal((await d.sync(r, auto)).deferred, 1);
+    assert.equal(hints.at(-1), undefined);
+    await d.sync(r, {review:() => choose([], [["note.md","remote"]])});
+    // Old 1.0.1 baselines lack the completeness flag and must get a full first comparison.
+    delete d.state.settled;
+    assert.equal((await d.sync(r, auto)).received, 0); assert.equal(hints.at(-1), undefined);
+});

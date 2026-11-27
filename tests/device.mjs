@@ -38,8 +38,17 @@ export async function device() {
         },
         text: path => adapter.read(path),
         async sync(api, options = {}) {
+            const {confirm, ...settings} = options;
+            const review = async plan => {
+                if (plan.conflicts.length) {
+                    if (!confirm) throw new Error("Unexpected conflict: " + plan.conflicts.map(x => x.path));
+                    if (!await confirm(plan.conflicts)) return null;
+                }
+                return {selected: new Set(plan.outgoing.map(x => x.path)),
+                    conflicts: new Map(plan.conflicts.map(x => [x.path, "both"]))};
+            };
             return synchronize({adapter, api, target: api.target, state, save: value => { state = value; },
-                confirm: async changes => { throw new Error("Unexpected conflict: " + changes.map(x => x.path)); }, ...options});
+                review, ...settings});
         },
         cleanup: () => rm(root, {recursive: true, force: true})
     };

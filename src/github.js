@@ -97,9 +97,10 @@ export class GitHub {
         return result;
     }
 
-    async snapshot() {
+    async snapshot(knownHead) {
         const info = await this.repository();
         const head = await this.head();
+        if (head && head === knownHead) return {head, unchanged: true};
         const entries = new Map(), rules = new Map(), blocked = new Set();
         let tree = null;
         if (head) {
@@ -114,7 +115,7 @@ export class GitHub {
                 }
                 if (!this.scope.allowed(path) && !this.scope.allowed(path, true)) continue;
                 if (type !== "blob" || !["100644", "100755"].includes(mode)) blocked.add(path);
-                else if (this.scope.allowed(path)) entries.set(path, {mode, sha: checkedOid(item.sha)});
+                else if (this.scope.allowed(path)) entries.set(path, {mode, sha: checkedOid(item.sha), size: item.size});
             }
         }
         return {head, tree, entries, rules, blocked, node: info.node_id};

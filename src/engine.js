@@ -94,7 +94,7 @@ export function planChanges(base, local, remote, send) {
     for (const path of paths) {
         const before = base.get(path), here = local.get(path), there = remote.get(path);
         if (here === there) continue;
-        const change = { path, here, there };
+        const change = {path, before, here, there};
         if (here === before) incoming.push(change);
         else if (there === before) { if (send) outgoing.push(change); }
         else conflicts.push(change);
@@ -178,80 +178,124 @@ async function applyRemote(adapter, api, change) {
 
 export class HeadMoved extends Error {}
 
-export async function synchronize({adapter, api, target, state, scope = fileScope(), send = true, save,
-    confirm, progress = () => {}, allowInitialize = true}) {
+function setRevision(files, path, sha) {
+    if (sha) files.set(path, sha);
+    else files.delete(path);
+}
+
+async function uploadBytes(adapter, change) {
+    await adapter.flush?.(change.path);
+    const bytes = await readLocal(adapter, change.path);
+    if (await blobOid(bytes) !== change.here) throw new Error("Edited during upload. Run sync again: " + change.path);
+    return bytes;
+}
+
+export async function synchronize({adapter, api, target, state, scope = fileScope(), send = true,
+    fastReceive = false, save, review, progress = () => {}}) {
     const previous = fromState(state, target, scope);
     const base = previous || new Map();
     const first = !previous;
-    const snapshot = await api.snapshot();
+    const knownHead = fastReceive && !send && previous && state.settled ? state.head : undefined;
+    let snapshot = await api.snapshot(knownHead);
+    if (snapshot.unchanged) return {first: false, head: snapshot.head, received: 0, sent: 0, copies: 0, deferred: 0, conflicts: 0};
     const remote = new Map([...snapshot.entries].filter(([path]) => scope.allowed(path)).map(([path, entry]) => [path, entry.sha]));
-    // Submodules and symlinks are left entirely to ordinary Git.
-    const blocked = snapshot.blocked;
     for (const path of base.keys()) {
-        if ([...blocked].some(root => path === root || path.startsWith(root + "/"))) base.delete(path);
+        if ([...snapshot.blocked].some(root => path === root || path.startsWith(root + "/"))) base.delete(path);
     }
     const tracked = new Set([...base.keys(), ...remote.keys()]);
     progress("Comparing local files…");
     await adapter.flush?.();
-    const local = await localManifest(adapter, tracked, scopedRules(snapshot.rules), blocked, scope);
+    const local = await localManifest(adapter, tracked, scopedRules(snapshot.rules), snapshot.blocked, scope);
     checkNames(new Set([...local.keys(), ...remote.keys()]));
-    const plan = planChanges(base, local, remote, send && !first);
-    if (plan.conflicts.length && !await confirm(plan.conflicts)) return {canceled: true};
-    for (const change of plan.conflicts) await saveCopy(adapter, change, remote);
-    const inbound = [...plan.incoming, ...plan.conflicts];
+    const plan = planChanges(base, local, remote, true);
+    const canSend = send && !first;
+    let decision = {selected: new Set(), conflicts: new Map()};
+    if (plan.conflicts.length || (canSend && (plan.incoming.length || plan.outgoing.length))) {
+        decision = await review({
+            incoming: plan.incoming,
+            outgoing: canSend ? plan.outgoing : [],
+            conflicts: plan.conflicts,
+            canSend,
+            remoteSize: path => snapshot.entries.get(path)?.size
+        });
+        if (!decision) return {canceled: true};
+        if (await api.head() !== snapshot.head) throw new HeadMoved("The remote branch changed during review.");
+    }
+
+    const outgoing = canSend ? plan.outgoing.filter(change => decision.selected.has(change.path)) : [];
+    let pending = plan.outgoing.length - outgoing.length;
+    const inbound = [...plan.incoming], keepBoth = [], intended = new Map(remote);
+    let deferred = 0;
+    for (const change of plan.conflicts) {
+        const choice = decision.conflicts.get(change.path) ?? "later";
+        if (choice === "later") {
+            // A deferred conflict keeps its common ancestor across syncs, even when the branch advances.
+            setRevision(intended, change.path, change.before);
+            deferred++;
+        } else if (choice === "local" && canSend) {
+            setRevision(intended, change.path, change.before);
+            outgoing.push(change);
+        } else if (choice === "keep-local" && !canSend) {
+            // The reviewed remote revision becomes the baseline. The local edit
+            // stays eligible for selection on the next manual commit.
+            pending++;
+        } else if (choice === "remote" || choice === "both") {
+            if (choice === "both" && change.here) keepBoth.push(change);
+            inbound.push(change);
+        } else {
+            throw new Error("Invalid conflict decision for " + change.path);
+        }
+    }
+    for (const change of keepBoth) await saveCopy(adapter, change, remote);
     let received = 0;
     const acknowledged = previous && new Map(previous);
     try {
         for (const change of inbound) {
             progress("Receiving " + (received + 1) + "/" + inbound.length + " · " + change.path);
             await applyRemote(adapter, api, change);
-            if (change.there) acknowledged?.set(change.path, change.there);
-            else acknowledged?.delete(change.path);
+            if (acknowledged) setRevision(acknowledged, change.path, change.there);
             received++;
         }
     } finally {
-        // If another device advances main or the network drops, already received
-        // files are safe baselines. An incomplete first checkout must remain receive-only.
-        if (acknowledged && received) await save({...state, files: [...acknowledged]});
+        if (acknowledged && received) await save({...state, settled: false, files: [...acknowledged]});
     }
-    const intended = new Map(remote);
+
+    const baseline = (head, files, settled) => ({version: 1, ...target, settings: scope.settings,
+        configDir: scope.configDir, head, files: [...files], settled});
     let head = snapshot.head;
-    const baseline = (revision, files) => ({version: 1, ...target, settings: scope.settings,
-        configDir: scope.configDir, head: revision, files: [...files]});
-    if (plan.outgoing.length && !head) {
-        if (!allowInitialize) throw new HeadMoved("The branch changed while creating its first commit.");
-        const change = plan.outgoing.find(item => item.here);
-        if (!change) throw new Error("The empty branch has no file to commit.");
-        await adapter.flush?.(change.path);
-        const bytes = await readLocal(adapter, change.path);
-        if (await blobOid(bytes) !== change.here) throw new Error("Edited during sync: " + change.path);
-        const revision = await api.initialize(change.path, bytes, change.here);
-        const saved = baseline(revision, [[change.path, change.here]]);
-        await save(saved);
-        const rest = await synchronize({adapter, api, target, state: saved, scope, send, save, confirm, progress, allowInitialize: false});
-        return {...rest, sent: 1 + (rest.sent || 0)};
+    const sent = outgoing.length;
+    if (sent && !head) {
+        // GitHub's Contents API creates the first commit. Continue with the very same
+        // approved paths and hashes after bootstrapping the branch.
+        const index = outgoing.findIndex(change => change.here);
+        if (index < 0) throw new Error("The empty branch has no file to commit.");
+        const [initial] = outgoing.splice(index, 1);
+        head = await api.initialize(initial.path, await uploadBytes(adapter, initial), initial.here);
+        intended.set(initial.path, initial.here);
+        await save(baseline(head, intended, false));
+        if (outgoing.length) {
+            snapshot = await api.snapshot();
+            if (snapshot.head !== head) throw new HeadMoved("The branch changed after its first commit.");
+        }
     }
-    if (plan.outgoing.length) {
+    if (outgoing.length) {
         const changes = [];
-        for (const change of plan.outgoing) {
+        for (const change of outgoing) {
             const {path, here} = change;
             progress("Preparing commit · " + path);
-            await adapter.flush?.(path);
             if (here) {
-                const bytes = await readLocal(adapter, path);
-                if (await blobOid(bytes) !== here) throw new Error("Edited during upload. Run sync again: " + path);
-                await api.putBlob(bytes, here);
-                intended.set(path, here);
+                await api.putBlob(await uploadBytes(adapter, change), here);
             } else {
+                await adapter.flush?.(path);
                 if (await currentOid(adapter, path)) throw new Error("The deleted file reappeared. Run sync again: " + path);
-                intended.delete(path);
             }
+            setRevision(intended, path, here);
             changes.push({path, mode: snapshot.entries.get(path)?.mode || "100644", type: "blob", sha: here || null});
         }
         head = await api.commit(snapshot, changes);
     } else if (await api.head() !== head) {
         throw new HeadMoved("The remote branch changed.");
     }
-    await save(baseline(head, intended));
-    return {first, head, received, sent: plan.outgoing.length, copies: plan.conflicts.filter(c => c.here).length, conflicts: plan.conflicts.length};
+    await save(baseline(head, intended, deferred === 0));
+    return {first, head, received, sent, pending, copies: keepBoth.length, deferred, conflicts: plan.conflicts.length};
 }

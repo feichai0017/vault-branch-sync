@@ -515,7 +515,7 @@ __export(plugin_exports, {
   default: () => VaultBranchSync
 });
 module.exports = __toCommonJS(plugin_exports);
-var import_obsidian = require("obsidian");
+var import_obsidian2 = require("obsidian");
 
 // src/engine.js
 var import_ignore = __toESM(require_ignore(), 1);
@@ -652,7 +652,7 @@ function planChanges(base, local, remote, send) {
   for (const path of paths) {
     const before = base.get(path), here = local.get(path), there = remote.get(path);
     if (here === there) continue;
-    const change = { path, here, there };
+    const change = { path, before, here, there };
     if (here === before) incoming.push(change);
     else if (there === before) {
       if (send) outgoing.push(change);
@@ -728,6 +728,16 @@ async function applyRemote(adapter, api, change) {
 }
 var HeadMoved = class extends Error {
 };
+function setRevision(files, path, sha) {
+  if (sha) files.set(path, sha);
+  else files.delete(path);
+}
+async function uploadBytes(adapter, change) {
+  await adapter.flush?.(change.path);
+  const bytes = await readLocal(adapter, change.path);
+  if (await blobOid(bytes) !== change.here) throw new Error("Edited during upload. Run sync again: " + change.path);
+  return bytes;
+}
 async function synchronize({
   adapter,
   api,
@@ -735,90 +745,336 @@ async function synchronize({
   state,
   scope = fileScope(),
   send = true,
+  fastReceive = false,
   save,
-  confirm,
+  review,
   progress = () => {
-  },
-  allowInitialize = true
+  }
 }) {
   const previous = fromState(state, target, scope);
   const base = previous || /* @__PURE__ */ new Map();
   const first = !previous;
-  const snapshot = await api.snapshot();
+  const knownHead = fastReceive && !send && previous && state.settled ? state.head : void 0;
+  let snapshot = await api.snapshot(knownHead);
+  if (snapshot.unchanged) return { first: false, head: snapshot.head, received: 0, sent: 0, copies: 0, deferred: 0, conflicts: 0 };
   const remote = new Map([...snapshot.entries].filter(([path]) => scope.allowed(path)).map(([path, entry]) => [path, entry.sha]));
-  const blocked = snapshot.blocked;
   for (const path of base.keys()) {
-    if ([...blocked].some((root) => path === root || path.startsWith(root + "/"))) base.delete(path);
+    if ([...snapshot.blocked].some((root) => path === root || path.startsWith(root + "/"))) base.delete(path);
   }
   const tracked = /* @__PURE__ */ new Set([...base.keys(), ...remote.keys()]);
   progress("Comparing local files\u2026");
   await adapter.flush?.();
-  const local = await localManifest(adapter, tracked, scopedRules(snapshot.rules), blocked, scope);
+  const local = await localManifest(adapter, tracked, scopedRules(snapshot.rules), snapshot.blocked, scope);
   checkNames(/* @__PURE__ */ new Set([...local.keys(), ...remote.keys()]));
-  const plan = planChanges(base, local, remote, send && !first);
-  if (plan.conflicts.length && !await confirm(plan.conflicts)) return { canceled: true };
-  for (const change of plan.conflicts) await saveCopy(adapter, change, remote);
-  const inbound = [...plan.incoming, ...plan.conflicts];
+  const plan = planChanges(base, local, remote, true);
+  const canSend = send && !first;
+  let decision = { selected: /* @__PURE__ */ new Set(), conflicts: /* @__PURE__ */ new Map() };
+  if (plan.conflicts.length || canSend && (plan.incoming.length || plan.outgoing.length)) {
+    decision = await review({
+      incoming: plan.incoming,
+      outgoing: canSend ? plan.outgoing : [],
+      conflicts: plan.conflicts,
+      canSend,
+      remoteSize: (path) => snapshot.entries.get(path)?.size
+    });
+    if (!decision) return { canceled: true };
+    if (await api.head() !== snapshot.head) throw new HeadMoved("The remote branch changed during review.");
+  }
+  const outgoing = canSend ? plan.outgoing.filter((change) => decision.selected.has(change.path)) : [];
+  let pending = plan.outgoing.length - outgoing.length;
+  const inbound = [...plan.incoming], keepBoth = [], intended = new Map(remote);
+  let deferred = 0;
+  for (const change of plan.conflicts) {
+    const choice = decision.conflicts.get(change.path) ?? "later";
+    if (choice === "later") {
+      setRevision(intended, change.path, change.before);
+      deferred++;
+    } else if (choice === "local" && canSend) {
+      setRevision(intended, change.path, change.before);
+      outgoing.push(change);
+    } else if (choice === "keep-local" && !canSend) {
+      pending++;
+    } else if (choice === "remote" || choice === "both") {
+      if (choice === "both" && change.here) keepBoth.push(change);
+      inbound.push(change);
+    } else {
+      throw new Error("Invalid conflict decision for " + change.path);
+    }
+  }
+  for (const change of keepBoth) await saveCopy(adapter, change, remote);
   let received = 0;
   const acknowledged = previous && new Map(previous);
   try {
     for (const change of inbound) {
       progress("Receiving " + (received + 1) + "/" + inbound.length + " \xB7 " + change.path);
       await applyRemote(adapter, api, change);
-      if (change.there) acknowledged?.set(change.path, change.there);
-      else acknowledged?.delete(change.path);
+      if (acknowledged) setRevision(acknowledged, change.path, change.there);
       received++;
     }
   } finally {
-    if (acknowledged && received) await save({ ...state, files: [...acknowledged] });
+    if (acknowledged && received) await save({ ...state, settled: false, files: [...acknowledged] });
   }
-  const intended = new Map(remote);
-  let head = snapshot.head;
-  const baseline = (revision, files) => ({
+  const baseline = (head2, files, settled) => ({
     version: 1,
     ...target,
     settings: scope.settings,
     configDir: scope.configDir,
-    head: revision,
-    files: [...files]
+    head: head2,
+    files: [...files],
+    settled
   });
-  if (plan.outgoing.length && !head) {
-    if (!allowInitialize) throw new HeadMoved("The branch changed while creating its first commit.");
-    const change = plan.outgoing.find((item) => item.here);
-    if (!change) throw new Error("The empty branch has no file to commit.");
-    await adapter.flush?.(change.path);
-    const bytes = await readLocal(adapter, change.path);
-    if (await blobOid(bytes) !== change.here) throw new Error("Edited during sync: " + change.path);
-    const revision = await api.initialize(change.path, bytes, change.here);
-    const saved = baseline(revision, [[change.path, change.here]]);
-    await save(saved);
-    const rest = await synchronize({ adapter, api, target, state: saved, scope, send, save, confirm, progress, allowInitialize: false });
-    return { ...rest, sent: 1 + (rest.sent || 0) };
+  let head = snapshot.head;
+  const sent = outgoing.length;
+  if (sent && !head) {
+    const index = outgoing.findIndex((change) => change.here);
+    if (index < 0) throw new Error("The empty branch has no file to commit.");
+    const [initial] = outgoing.splice(index, 1);
+    head = await api.initialize(initial.path, await uploadBytes(adapter, initial), initial.here);
+    intended.set(initial.path, initial.here);
+    await save(baseline(head, intended, false));
+    if (outgoing.length) {
+      snapshot = await api.snapshot();
+      if (snapshot.head !== head) throw new HeadMoved("The branch changed after its first commit.");
+    }
   }
-  if (plan.outgoing.length) {
+  if (outgoing.length) {
     const changes = [];
-    for (const change of plan.outgoing) {
+    for (const change of outgoing) {
       const { path, here } = change;
       progress("Preparing commit \xB7 " + path);
-      await adapter.flush?.(path);
       if (here) {
-        const bytes = await readLocal(adapter, path);
-        if (await blobOid(bytes) !== here) throw new Error("Edited during upload. Run sync again: " + path);
-        await api.putBlob(bytes, here);
-        intended.set(path, here);
+        await api.putBlob(await uploadBytes(adapter, change), here);
       } else {
+        await adapter.flush?.(path);
         if (await currentOid(adapter, path)) throw new Error("The deleted file reappeared. Run sync again: " + path);
-        intended.delete(path);
       }
+      setRevision(intended, path, here);
       changes.push({ path, mode: snapshot.entries.get(path)?.mode || "100644", type: "blob", sha: here || null });
     }
     head = await api.commit(snapshot, changes);
   } else if (await api.head() !== head) {
     throw new HeadMoved("The remote branch changed.");
   }
-  await save(baseline(head, intended));
-  return { first, head, received, sent: plan.outgoing.length, copies: plan.conflicts.filter((c) => c.here).length, conflicts: plan.conflicts.length };
+  await save(baseline(head, intended, deferred === 0));
+  return { first, head, received, sent, pending, copies: keepBoth.length, deferred, conflicts: plan.conflicts.length };
 }
+
+// src/compare.js
+var maxPreviewBytes = 512 * 1024;
+var maxCells = 16e4;
+function isMarkdownNote(path) {
+  return /\.md$/i.test(path) && !/\.excalidraw\.md$/i.test(path);
+}
+function compareParagraphs(local, remote) {
+  const paragraphs = (text) => text ? text.replace(/\r\n?/g, "\n").split(/\n[ \t]*\n/) : [];
+  const leftText = paragraphs(local), rightText = paragraphs(remote);
+  let start = 0, leftEnd = leftText.length, rightEnd = rightText.length;
+  while (start < leftEnd && start < rightEnd && leftText[start] === rightText[start]) start++;
+  while (leftEnd > start && rightEnd > start && leftText[leftEnd - 1] === rightText[rightEnd - 1]) {
+    leftEnd--;
+    rightEnd--;
+  }
+  const left = leftText.slice(start, leftEnd), right = rightText.slice(start, rightEnd);
+  const width = right.length + 1;
+  if ((left.length + 1) * width > maxCells) {
+    return {
+      kind: "excerpts",
+      number: start + 1,
+      local: left.join("\n\n").slice(0, 3500),
+      remote: right.join("\n\n").slice(0, 3500)
+    };
+  }
+  const lengths = new Uint32Array((left.length + 1) * width);
+  for (let i2 = left.length - 1; i2 >= 0; i2--) {
+    for (let j2 = right.length - 1; j2 >= 0; j2--) {
+      const pos = i2 * width + j2;
+      lengths[pos] = left[i2] === right[j2] ? 1 + lengths[pos + width + 1] : Math.max(lengths[pos + width], lengths[pos + 1]);
+    }
+  }
+  const changes = [];
+  let i = 0, j = 0;
+  while (i < left.length || j < right.length) {
+    if (i < left.length && j < right.length && left[i] === right[j]) {
+      i++;
+      j++;
+    } else if (i < left.length && (j === right.length || lengths[(i + 1) * width + j] >= lengths[i * width + j + 1])) {
+      changes.push({ side: "local", number: start + i + 1, text: left[i++] });
+    } else {
+      changes.push({ side: "remote", number: start + j + 1, text: right[j++] });
+    }
+  }
+  return { kind: "paragraphs", changes };
+}
+async function compareNote(change, adapter, api, remoteSize) {
+  if (!isMarkdownNote(change.path)) return { kind: "attachment" };
+  await adapter.flush?.(change.path);
+  const stat = await adapter.stat(change.path);
+  if (Boolean(stat) !== Boolean(change.here) || stat?.type === "folder") {
+    throw new Error("Local file changed. Reopen the review: " + change.path);
+  }
+  if (stat?.size > maxPreviewBytes || remoteSize > maxPreviewBytes) return { kind: "large" };
+  const [local, remote] = await Promise.all([
+    change.here ? adapter.readBinary(change.path) : null,
+    change.there ? api.readBlob(change.there) : null
+  ]);
+  if (local && await blobOid(local) !== change.here) throw new Error("Local file changed. Reopen the review: " + change.path);
+  if (local?.byteLength > maxPreviewBytes || remote?.byteLength > maxPreviewBytes) return { kind: "large" };
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let left, right;
+  try {
+    left = local ? decoder.decode(local) : "";
+    right = remote ? decoder.decode(remote) : "";
+  } catch {
+    return { kind: "attachment" };
+  }
+  const drawing = (text) => {
+    const header = text.slice(0, 2e3).replace(/\r\n/g, "\n").split("\n---")[0];
+    return header.startsWith("---\n") && /^excalidraw-plugin:/m.test(header);
+  };
+  if (drawing(left) || drawing(right)) return { kind: "attachment" };
+  return compareParagraphs(left, right);
+}
+
+// src/review.js
+var import_obsidian = require("obsidian");
+var t = (en, zh) => (0, import_obsidian.getLanguage)().startsWith("zh") ? zh : en;
+function editLabel(before, after) {
+  if (!after) return t("Deleted", "\u5220\u9664");
+  return before ? t("Modified", "\u4FEE\u6539") : t("Added", "\u65B0\u589E");
+}
+function showText(el, text) {
+  const paragraph = el.createEl("p");
+  for (const [index, line] of text.split("\n").entries()) {
+    if (index) paragraph.createEl("br");
+    paragraph.appendText(line);
+  }
+}
+function renderComparison(el, comparison) {
+  const side = (name) => name === "local" ? t("This device", "\u672C\u673A") : "GitHub";
+  if (comparison.kind === "large" || comparison.kind === "attachment") {
+    el.createEl("p", { text: comparison.kind === "large" ? t("Paragraph previews support notes up to 512 KiB per version.", "\u6BB5\u843D\u5BF9\u6BD4\u652F\u6301\u6BCF\u4E2A\u7248\u672C\u4E0D\u8D85\u8FC7 512 KiB \u7684\u7B14\u8BB0\u3002") : t("This is a drawing or binary attachment. Keep both to inspect the two files.", "\u8FD9\u662F\u7ED8\u56FE\u6216\u4E8C\u8FDB\u5236\u9644\u4EF6\uFF0C\u53EF\u4FDD\u7559\u4E24\u4EFD\u540E\u5206\u522B\u67E5\u770B\u3002") });
+    return;
+  }
+  if (comparison.kind === "excerpts") {
+    el.createEl("p", { text: t("Showing excerpts from the first differing paragraph", "\u4EE5\u4E0B\u8282\u9009\u4ECE\u4E24\u4EFD\u7B14\u8BB0\u7684\u9996\u4E2A\u5DEE\u5F02\u6BB5\u843D\u5F00\u59CB") + " \xB7 " + comparison.number });
+    for (const name of ["local", "remote"]) {
+      el.createEl("strong", { text: side(name) });
+      showText(el, comparison[name]);
+    }
+    return;
+  }
+  if (!comparison.changes.length) {
+    el.createEl("p", { text: t("Paragraph text matches after normalizing line endings.", "\u7EDF\u4E00\u6362\u884C\u683C\u5F0F\u540E\uFF0C\u4E24\u8FB9\u7684\u6BB5\u843D\u6587\u5B57\u4E00\u81F4\u3002") });
+    return;
+  }
+  for (const item of comparison.changes.slice(0, 80)) {
+    el.createEl("strong", { text: side(item.side) + t(" \xB7 paragraph ", " \xB7 \u7B2C ") + item.number + t("", " \u6BB5") });
+    showText(el, item.text.length > 3500 ? item.text.slice(0, 3500) + "\u2026" : item.text);
+  }
+  if (comparison.changes.length > 80) el.createEl("p", { text: t("Showing the first 80 differing paragraphs.", "\u4EE5\u4E0A\u4E3A\u524D 80 \u4E2A\u5DEE\u5F02\u6BB5\u843D\u3002") });
+}
+var SyncReview = class extends import_obsidian.Modal {
+  constructor(app, plan, compare, finish) {
+    super(app);
+    this.plan = plan;
+    this.compare = compare;
+    this.finish = finish;
+    this.selected = /* @__PURE__ */ new Set();
+    this.conflicts = /* @__PURE__ */ new Map();
+    this.result = null;
+  }
+  onOpen() {
+    this.setTitle(t("Review sync changes", "\u9884\u89C8\u540C\u6B65\u6539\u52A8"));
+    const el = this.contentEl;
+    if (this.plan.incoming.length) {
+      const section = el.createEl("details");
+      section.createEl("summary", { text: t("Receive from GitHub", "\u4ECE GitHub \u63A5\u6536") + " (" + this.plan.incoming.length + ")" });
+      const list = section.createEl("ul");
+      for (const change of this.plan.incoming) list.createEl("li", { text: editLabel(change.before, change.there) + " \xB7 " + change.path });
+    }
+    if (this.plan.outgoing.length) this.showOutgoing(el);
+    if (this.plan.conflicts.length) {
+      el.createEl("h3", { text: t("Conflicts", "\u51B2\u7A81\u6587\u4EF6") });
+      el.createEl("p", { text: t(
+        "Choose a version for each file. Keep both saves a local copy in Sync conflicts and puts the GitHub version at the original path.",
+        "\u9010\u4E2A\u9009\u62E9\u8981\u4FDD\u7559\u7684\u7248\u672C\u3002\u9009\u300C\u4FDD\u7559\u4E24\u4EFD\u300D\u4F1A\u628A\u672C\u673A\u526F\u672C\u5B58\u5165 Sync conflicts\uFF0C\u539F\u8DEF\u5F84\u91C7\u7528 GitHub \u7248\u672C\u3002"
+      ) });
+      for (const change of this.plan.conflicts) this.showConflict(el, change);
+    }
+    this.actions = new import_obsidian.Setting(el).addButton((b) => b.setButtonText(t("Cancel", "\u53D6\u6D88")).onClick(() => this.close())).addButton((b) => b.setButtonText(t("Apply choices", "\u5E94\u7528\u9009\u62E9")).setCta().onClick(() => {
+      this.result = { selected: this.selected, conflicts: this.conflicts };
+      this.close();
+    }));
+    this.actions.descEl.setAttribute("aria-live", "polite");
+    this.updateCount();
+  }
+  updateCount() {
+    if (!this.actions || !this.plan.canSend) return;
+    const localConflicts = [...this.conflicts.values()].filter((choice) => choice === "local").length;
+    this.actions.setDesc(t("Files to commit", "\u672C\u6B21\u63D0\u4EA4\u7684\u6587\u4EF6") + " \xB7 " + (this.selected.size + localConflicts));
+  }
+  showOutgoing(el) {
+    const toggles = /* @__PURE__ */ new Map();
+    const setAll = (value) => {
+      this.selected.clear();
+      for (const [path, toggle] of toggles) {
+        if (value) this.selected.add(path);
+        toggle.setValue(value);
+      }
+      this.updateCount();
+    };
+    new import_obsidian.Setting(el).setName(t("Commit to GitHub", "\u63D0\u4EA4\u5230 GitHub")).setHeading().addButton((b) => b.setButtonText(t("Select all", "\u5168\u9009")).onClick(() => setAll(true))).addButton((b) => b.setButtonText(t("Clear selection", "\u6E05\u7A7A\u9009\u62E9")).onClick(() => setAll(false)));
+    for (const change of this.plan.outgoing) {
+      new import_obsidian.Setting(el).setName(change.path).setDesc(editLabel(change.before, change.here)).addToggle((toggle) => {
+        toggles.set(change.path, toggle);
+        toggle.setValue(false).onChange((value) => {
+          if (value) this.selected.add(change.path);
+          else this.selected.delete(change.path);
+          this.updateCount();
+        });
+        toggle.toggleEl.setAttribute("aria-label", t("Commit ", "\u63D0\u4EA4 ") + change.path);
+      });
+    }
+  }
+  showConflict(el, change) {
+    const group = el.createDiv();
+    const states = t("This device", "\u672C\u673A") + " \xB7 " + editLabel(change.before, change.here) + " / GitHub \xB7 " + editLabel(change.before, change.there);
+    new import_obsidian.Setting(group).setName(change.path).setDesc(states).addDropdown((input) => {
+      input.addOption("later", t("Decide later", "\u7A0D\u540E\u5904\u7406"));
+      input.addOption("both", t("Keep both", "\u4FDD\u7559\u4E24\u4EFD"));
+      input.addOption("remote", change.there ? t("Use GitHub version", "\u91C7\u7528 GitHub \u7248\u672C") : t("Apply GitHub deletion", "\u91C7\u7528 GitHub \u7684\u5220\u9664"));
+      if (this.plan.canSend) input.addOption("local", change.here ? t("Commit local version", "\u63D0\u4EA4\u672C\u673A\u7248\u672C") : t("Commit local deletion", "\u63D0\u4EA4\u672C\u673A\u7684\u5220\u9664"));
+      else input.addOption("keep-local", t("Keep local change for a later commit", "\u4FDD\u7559\u672C\u673A\u6539\u52A8\uFF0C\u7A0D\u540E\u63D0\u4EA4"));
+      input.setValue("later").onChange((value) => {
+        this.conflicts.set(change.path, value);
+        this.updateCount();
+      });
+      input.selectEl.setAttribute("aria-label", t("Resolve ", "\u5904\u7406\u51B2\u7A81 ") + change.path);
+    });
+    if (!isMarkdownNote(change.path)) return;
+    const details = group.createEl("details");
+    details.createEl("summary", { text: t("Compare paragraphs", "\u6BD4\u8F83\u6BB5\u843D") });
+    const body = details.createDiv();
+    let loaded = false;
+    details.addEventListener("toggle", async () => {
+      if (!details.open || loaded) return;
+      loaded = true;
+      body.setText(t("Loading versions\u2026", "\u6B63\u5728\u8BFB\u53D6\u4E24\u4E2A\u7248\u672C\u2026"));
+      try {
+        const comparison = await this.compare(change);
+        body.empty();
+        renderComparison(body, comparison);
+      } catch (error) {
+        loaded = false;
+        body.setText(error.message);
+      }
+    });
+  }
+  onClose() {
+    this.contentEl.empty();
+    this.finish(this.result);
+  }
+};
 
 // src/github.js
 var host = "https://api.github.com";
@@ -912,9 +1168,10 @@ var GitHub = class {
     await visit(tree, "");
     return result;
   }
-  async snapshot() {
+  async snapshot(knownHead) {
     const info = await this.repository();
     const head = await this.head();
+    if (head && head === knownHead) return { head, unchanged: true };
     const entries = /* @__PURE__ */ new Map(), rules = /* @__PURE__ */ new Map(), blocked = /* @__PURE__ */ new Set();
     let tree = null;
     if (head) {
@@ -928,7 +1185,7 @@ var GitHub = class {
         }
         if (!this.scope.allowed(path) && !this.scope.allowed(path, true)) continue;
         if (type !== "blob" || !["100644", "100755"].includes(mode)) blocked.add(path);
-        else if (this.scope.allowed(path)) entries.set(path, { mode, sha: checkedOid(item.sha) });
+        else if (this.scope.allowed(path)) entries.set(path, { mode, sha: checkedOid(item.sha), size: item.size });
       }
     }
     return { head, tree, entries, rules, blocked, node: info.node_id };
@@ -979,8 +1236,9 @@ var GitHub = class {
 // src/plugin.js
 var connectionKey = "vault-branch-sync.connection.v1";
 var baselineKey = "vault-branch-sync.baseline.v1";
+var autoKey = "vault-branch-sync.auto-receive";
+var statusKey = "vault-branch-sync.last-sync";
 var tokenPage = "https://github.com/settings/personal-access-tokens/new?name=Vault%20Branch%20Sync&contents=write";
-var t = (en, zh) => (0, import_obsidian.getLanguage)().startsWith("zh") ? zh : en;
 function vaultFiles(app, scope) {
   const vault = app.vault, disk = vault.adapter;
   const isConfig = (path) => path === scope.configDir || path.startsWith(scope.configDir + "/");
@@ -989,7 +1247,7 @@ function vaultFiles(app, scope) {
       if (isConfig(dir)) return disk.list(dir);
       const folder = dir ? vault.getFolderByPath(dir) : vault.getRoot();
       const files = [], folders = [];
-      for (const item of folder?.children || []) (item instanceof import_obsidian.TFolder ? folders : files).push(item.path);
+      for (const item of folder?.children || []) (item instanceof import_obsidian2.TFolder ? folders : files).push(item.path);
       const rule = (dir ? dir + "/" : "") + ".gitignore";
       if (await disk.exists(rule)) files.push(rule);
       if (!dir && scope.settings && !folders.includes(scope.configDir) && await disk.exists(scope.configDir)) folders.push(scope.configDir);
@@ -1000,7 +1258,7 @@ function vaultFiles(app, scope) {
     read: (path) => disk.read(path),
     readBinary: (path) => disk.readBinary(path),
     async flush(path) {
-      const view = app.workspace.getActiveViewOfType(import_obsidian.TextFileView);
+      const view = app.workspace.getActiveViewOfType(import_obsidian2.TextFileView);
       if (view?.file && (!path || view.file.path === path)) await view.save(false);
     },
     mkdir: (path) => isConfig(path) ? disk.mkdir(path) : vault.createFolder(path),
@@ -1016,31 +1274,7 @@ function vaultFiles(app, scope) {
     }
   };
 }
-var Conflicts = class extends import_obsidian.Modal {
-  constructor(app, changes, resolve) {
-    super(app);
-    this.changes = changes;
-    this.resolve = resolve;
-  }
-  onOpen() {
-    this.setTitle(t("Keep both versions?", "\u4FDD\u7559\u4E24\u8FB9\u7684\u7248\u672C\uFF1F"));
-    this.contentEl.createEl("p", { text: t(
-      "The following files changed on both sides. Keep both saves your local version in \u201CSync conflicts\u201D and applies the GitHub version at the original path. A remote deletion moves the original to the vault trash.",
-      "\u4EE5\u4E0B\u6587\u4EF6\u5728\u4E24\u8FB9\u90FD\u6709\u6539\u52A8\u3002\u9009\u62E9\u300C\u4FDD\u7559\u4E24\u4EFD\u300D\u4F1A\u628A\u672C\u673A\u7248\u672C\u5B58\u5165\u300CSync conflicts\u300D\uFF0C\u539F\u8DEF\u5F84\u91C7\u7528 GitHub \u7248\u672C\u3002GitHub \u5DF2\u5220\u9664\u7684\u539F\u6587\u4EF6\u4F1A\u79FB\u5165\u672C\u673A\u5E9F\u7EB8\u7BD3\u3002"
-    ) });
-    const list = this.contentEl.createEl("ul");
-    for (const { path } of this.changes) list.createEl("li", { text: path });
-    new import_obsidian.Setting(this.contentEl).addButton((button) => button.setButtonText(t("Cancel", "\u53D6\u6D88")).onClick(() => this.close())).addButton((button) => button.setButtonText(t("Keep both", "\u4FDD\u7559\u4E24\u4EFD")).setCta().onClick(() => {
-      this.resolve(true);
-      this.close();
-    }));
-  }
-  onClose() {
-    this.resolve(false);
-    this.contentEl.empty();
-  }
-};
-var Settings = class extends import_obsidian.PluginSettingTab {
+var Settings = class extends import_obsidian2.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
@@ -1049,33 +1283,33 @@ var Settings = class extends import_obsidian.PluginSettingTab {
     const el = this.containerEl, plugin = this.plugin, current = plugin.connection();
     el.empty();
     let repoInput, branchInput, tokenInput, share = current?.settings ?? false;
-    new import_obsidian.Setting(el).setName(t("Private GitHub repository", "GitHub \u79C1\u6709\u4ED3\u5E93")).setDesc(t("Use a repository for your vault. Enter owner/name or its GitHub URL.", "\u586B\u5199\u7B14\u8BB0\u4ED3\u5E93\u7684 owner/name \u6216 GitHub \u5730\u5740\u3002")).addText((input) => {
+    new import_obsidian2.Setting(el).setName(t("Private GitHub repository", "GitHub \u79C1\u6709\u4ED3\u5E93")).setDesc(t("Use a repository for your vault. Enter owner/name or its GitHub URL.", "\u586B\u5199\u7B14\u8BB0\u4ED3\u5E93\u7684 owner/name \u6216 GitHub \u5730\u5740\u3002")).addText((input) => {
       repoInput = input;
       input.setPlaceholder("owner/my-notes").setValue(current?.repository || "");
     });
-    new import_obsidian.Setting(el).setName(t("Branch", "\u5206\u652F")).setDesc(t("Leave blank to use the repository's default branch.", "\u7559\u7A7A\u65F6\u4F7F\u7528\u4ED3\u5E93\u9ED8\u8BA4\u5206\u652F\u3002")).addText((input) => {
+    new import_obsidian2.Setting(el).setName(t("Branch", "\u5206\u652F")).setDesc(t("Leave blank to use the repository's default branch.", "\u7559\u7A7A\u65F6\u4F7F\u7528\u4ED3\u5E93\u9ED8\u8BA4\u5206\u652F\u3002")).addText((input) => {
       branchInput = input;
       input.setPlaceholder(t("Default branch", "\u9ED8\u8BA4\u5206\u652F")).setValue(current?.branch || "");
     });
-    const desc = document.createDocumentFragment();
+    const desc = el.ownerDocument.createDocumentFragment();
     desc.appendText(t("Choose only your vault repository and grant Contents read and write. ", "\u53EA\u9009\u62E9\u81EA\u5DF1\u7684\u7B14\u8BB0\u4ED3\u5E93\uFF0C\u6388\u4E88 Contents \u8BFB\u5199\u6743\u9650\u3002"));
     desc.createEl("a", { text: t("Create a fine-grained token on GitHub", "\u5230 GitHub \u521B\u5EFA\u7EC6\u7C92\u5EA6\u4EE4\u724C"), href: tokenPage });
-    new import_obsidian.Setting(el).setName(t("GitHub token", "GitHub \u4EE4\u724C")).setDesc(desc).addText((input) => {
+    new import_obsidian2.Setting(el).setName(t("GitHub token", "GitHub \u4EE4\u724C")).setDesc(desc).addText((input) => {
       tokenInput = input;
       input.inputEl.type = "password";
       input.inputEl.autocomplete = "off";
       input.inputEl.spellcheck = false;
       input.setPlaceholder(current ? t("Saved on this device", "\u672C\u8BBE\u5907\u5DF2\u4FDD\u5B58") : t("Paste token", "\u7C98\u8D34\u4EE4\u724C"));
     });
-    new import_obsidian.Setting(el).setName(t("Include settings and themes", "\u540C\u6B65\u5E38\u7528\u8BBE\u7F6E\u4E0E\u4E3B\u9898")).setDesc(t(
+    new import_obsidian2.Setting(el).setName(t("Include settings and themes", "\u540C\u6B65\u5E38\u7528\u8BBE\u7F6E\u4E0E\u4E3B\u9898")).setDesc(t(
       "Also sync appearance, hotkeys, themes and CSS snippets in this vault's configuration folder. Close and reopen the vault to apply downloaded appearance changes.",
       "\u540C\u65F6\u540C\u6B65\u5916\u89C2\u3001\u5FEB\u6377\u952E\u3001\u4E3B\u9898\u548C CSS \u7247\u6BB5\u3002\u63A5\u6536\u540E\u91CD\u65B0\u6253\u5F00\u5E93\u5373\u53EF\u52A0\u8F7D\u5916\u89C2\u3002"
     )).addToggle((toggle) => toggle.setValue(share).onChange((value) => {
       share = value;
     }));
-    new import_obsidian.Setting(el).setName(t("Connect this device", "\u8FDE\u63A5\u672C\u8BBE\u5907")).setDesc(t(
-      "A new repository, branch or file scope starts with a download. After that, Sync can upload existing files in this vault.",
-      "\u66F4\u6362\u4ED3\u5E93\u3001\u5206\u652F\u6216\u540C\u6B65\u8303\u56F4\u540E\u9996\u6B21\u53EA\u63A5\u6536\u3002\u4E4B\u540E\u70B9\u51FB\u540C\u6B65\u4F1A\u4E0A\u4F20\u672C\u5E93\u4E2D\u6709\u6539\u52A8\u7684\u6587\u4EF6\u3002"
+    new import_obsidian2.Setting(el).setName(t("Connect this device", "\u8FDE\u63A5\u672C\u8BBE\u5907")).setDesc(t(
+      "A new connection starts with a download. Later you can choose which files to commit.",
+      "\u65B0\u8FDE\u63A5\u9996\u6B21\u53EA\u63A5\u6536\uFF0C\u4E4B\u540E\u53EF\u4EE5\u9009\u62E9\u8981\u63D0\u4EA4\u7684\u6587\u4EF6\u3002"
     )).addButton((button) => button.setButtonText(t("Save connection", "\u4FDD\u5B58\u8FDE\u63A5")).setCta().onClick(async () => {
       if (plugin.busy) return;
       button.setDisabled(true);
@@ -1083,23 +1317,87 @@ var Settings = class extends import_obsidian.PluginSettingTab {
         await plugin.connect(repoInput.getValue(), branchInput.getValue(), tokenInput.getValue(), share);
         tokenInput.setValue("");
         this.display();
-        new import_obsidian.Notice(t("Connected. Use Receive changes to download this branch.", "\u5DF2\u8FDE\u63A5\u3002\u70B9\u300C\u4EC5\u63A5\u6536\u300D\u4E0B\u8F7D\u8FD9\u4E2A\u5206\u652F\u3002"));
+        new import_obsidian2.Notice(t("Connected. Use Receive changes to download this branch.", "\u5DF2\u8FDE\u63A5\u3002\u70B9\u300C\u4EC5\u63A5\u6536\u300D\u4E0B\u8F7D\u8FD9\u4E2A\u5206\u652F\u3002"));
       } catch (error) {
-        new import_obsidian.Notice(error.message, 1e4);
+        new import_obsidian2.Notice(error.message, 1e4);
       } finally {
         button.setDisabled(false);
       }
     }));
-    new import_obsidian.Setting(el).setName(t("Sync vault", "\u540C\u6B65\u7B14\u8BB0")).setDesc(t("Receive remote changes and send local edits in a Git commit.", "\u63A5\u6536\u8FDC\u7AEF\u66F4\u65B0\uFF0C\u5E76\u628A\u672C\u673A\u6539\u52A8\u63D0\u4EA4\u5230 GitHub\u3002")).addButton((b) => b.setButtonText(t("Sync now", "\u7ACB\u5373\u540C\u6B65")).onClick(() => plugin.run(true))).addButton((b) => b.setButtonText(t("Receive changes", "\u4EC5\u63A5\u6536")).onClick(() => plugin.run(false)));
+    new import_obsidian2.Setting(el).setName(t("Receive when opening or returning to this vault", "\u6253\u5F00\u7B14\u8BB0\u5E93\u6216\u56DE\u5230\u524D\u53F0\u65F6\u81EA\u52A8\u63A5\u6536")).setDesc(t(
+      "On this device, download GitHub changes and leave conflicts for review. Uploads are always manual.",
+      "\u6B64\u8BBE\u5907\u4F1A\u81EA\u52A8\u63A5\u6536 GitHub \u66F4\u65B0\uFF0C\u9047\u5230\u51B2\u7A81\u7559\u5F85\u4F60\u9009\u62E9\u3002\u4E0A\u4F20\u4ECD\u7531\u4F60\u624B\u52A8\u53D1\u8D77\u3002"
+    )).addToggle((toggle) => toggle.setValue(plugin.autoEnabled()).onChange((value) => {
+      this.app.saveLocalStorage(autoKey, value);
+      plugin.scheduleReceive();
+    }));
+    this.statusSetting = new import_obsidian2.Setting(el).setName(t("Sync status on this device", "\u672C\u8BBE\u5907\u540C\u6B65\u72B6\u6001"));
+    plugin.refreshStatus();
+    new import_obsidian2.Setting(el).setName(t("Sync vault", "\u540C\u6B65\u7B14\u8BB0")).setDesc(t("Review incoming changes and choose the local files to commit together.", "\u9884\u89C8\u5F85\u63A5\u6536\u7684\u6539\u52A8\uFF0C\u5E76\u52FE\u9009\u672C\u6B21\u4E00\u8D77\u63D0\u4EA4\u7684\u6587\u4EF6\u3002")).addButton((b) => b.setButtonText(t("Review changes", "\u9884\u89C8\u540C\u6B65\u6539\u52A8")).onClick(() => plugin.run(true))).addButton((b) => b.setButtonText(t("Receive changes", "\u4EC5\u63A5\u6536")).onClick(() => plugin.run(false)));
+  }
+  hide() {
+    this.statusSetting = null;
   }
 };
-var VaultBranchSync = class extends import_obsidian.Plugin {
+var VaultBranchSync = class extends import_obsidian2.Plugin {
   onload() {
     this.busy = false;
-    this.addSettingTab(new Settings(this.app, this));
+    this.active = true;
+    this.ready = false;
+    this.settingsTab = new Settings(this.app, this);
+    this.addSettingTab(this.settingsTab);
+    if (!import_obsidian2.Platform.isMobile) this.statusBar = this.addStatusBarItem();
+    this.refreshStatus();
     this.addRibbonIcon("refresh-cw", t("Sync vault with GitHub", "\u540C\u6B65\u7B14\u8BB0\u5230 GitHub"), () => this.run(true));
     this.addCommand({ id: "sync", name: t("Sync with GitHub", "\u4E0E GitHub \u540C\u6B65"), callback: () => this.run(true) });
     this.addCommand({ id: "receive", name: t("Receive changes from GitHub", "\u4EC5\u63A5\u6536 GitHub \u66F4\u65B0"), callback: () => this.run(false) });
+    this.addCommand({ id: "show-status", name: t("Show sync status", "\u67E5\u770B\u540C\u6B65\u72B6\u6001"), callback: () => new import_obsidian2.Notice(this.statusText(), 8e3) });
+    this.app.workspace.onLayoutReady(() => {
+      if (!this.active) return;
+      this.doc = this.app.workspace.containerEl.ownerDocument;
+      this.win = this.doc.defaultView;
+      this.ready = true;
+      this.registerDomEvent(this.doc, "visibilitychange", () => this.scheduleReceive());
+      this.registerDomEvent(this.win, "focus", () => this.scheduleReceive());
+      this.scheduleReceive();
+    });
+  }
+  onunload() {
+    this.active = false;
+    this.win?.clearTimeout(this.autoTimer);
+    this.reviewModal?.close();
+  }
+  autoEnabled() {
+    return this.app.loadLocalStorage(autoKey) === true;
+  }
+  scheduleReceive() {
+    if (!this.ready || !this.active) return;
+    this.win.clearTimeout(this.autoTimer);
+    if (this.doc.hidden || this.busy || !this.autoEnabled() || !this.connection()) return;
+    this.autoTimer = this.win.setTimeout(() => {
+      if (this.active && !this.doc.hidden && !this.busy && this.autoEnabled()) void this.run(false, true);
+    }, 300);
+  }
+  statusText() {
+    const status = this.app.loadLocalStorage(statusKey);
+    let text = status?.lastSuccess ? t("Last successful sync", "\u4E0A\u6B21\u6210\u529F\u540C\u6B65") + " \xB7 " + new Date(status.lastSuccess).toLocaleString((0, import_obsidian2.getLanguage)()) : t("No successful sync on this device yet.", "\u672C\u8BBE\u5907\u8FD8\u6CA1\u6709\u6210\u529F\u540C\u6B65\u8BB0\u5F55\u3002");
+    if (status) {
+      text += t(" | Last check: received ", " | \u4E0A\u6B21\u68C0\u67E5\u63A5\u6536 ") + status.received + t(", committed ", "\uFF0C\u63D0\u4EA4 ") + status.sent;
+      if (status.deferred) text += t(", conflicts to review ", "\uFF0C\u5F85\u5904\u7406\u51B2\u7A81 ") + status.deferred;
+    }
+    if (this.lastError) text += " | " + this.lastError;
+    return text;
+  }
+  refreshStatus() {
+    const text = this.statusText();
+    this.settingsTab?.statusSetting?.setDesc(text);
+    if (this.statusBar) {
+      const status = this.app.loadLocalStorage(statusKey);
+      const time = status?.lastSuccess ? new Date(status.lastSuccess).toLocaleTimeString((0, import_obsidian2.getLanguage)(), { hour: "2-digit", minute: "2-digit" }) : "\u2014";
+      this.statusBar.setText(this.connection() ? "GitHub \xB7 " + time + (status?.deferred || this.lastError ? " \u26A0" : "") : "");
+      this.statusBar.setAttribute("aria-label", text);
+      this.statusBar.title = text;
+    }
   }
   connection() {
     return this.app.loadLocalStorage(connectionKey);
@@ -1107,14 +1405,14 @@ var VaultBranchSync = class extends import_obsidian.Plugin {
   client(target, token, scope) {
     return new GitHub(target, token, async (options) => {
       try {
-        return await (0, import_obsidian.requestUrl)(options);
+        return await (0, import_obsidian2.requestUrl)(options);
       } catch {
         throw new Error(t(
           "Could not reach GitHub. You can keep editing offline and retry later.",
           "\u6682\u65F6\u8FDE\u4E0D\u4E0A GitHub\uFF0C\u53EF\u4EE5\u7EE7\u7EED\u79BB\u7EBF\u8BB0\u5F55\uFF0C\u8054\u7F51\u540E\u518D\u6B21\u540C\u6B65\u3002"
         ));
       }
-    }, import_obsidian.arrayBufferToBase64, scope);
+    }, import_obsidian2.arrayBufferToBase64, scope);
   }
   async connect(name, branchValue, tokenValue, settings) {
     this.busy = true;
@@ -1132,19 +1430,25 @@ var VaultBranchSync = class extends import_obsidian.Plugin {
       const secretId = previous?.secretId || "vault-branch-sync-" + crypto.randomUUID();
       this.app.secretStorage.setSecret(secretId, token);
       this.app.saveLocalStorage(connectionKey, { ...target, secretId, settings });
-      if (!sameTarget(previous, target) || previous?.settings !== settings) this.app.saveLocalStorage(baselineKey, null);
+      if (!sameTarget(previous, target) || previous?.settings !== settings) {
+        this.app.saveLocalStorage(baselineKey, null);
+        this.app.saveLocalStorage(statusKey, null);
+      }
+      this.lastError = null;
+      this.refreshStatus();
     } finally {
       this.busy = false;
     }
+    this.scheduleReceive();
   }
-  async run(send) {
-    if (this.busy) {
-      new import_obsidian.Notice(t("A sync or connection check is already running.", "\u6B63\u5728\u540C\u6B65\u6216\u68C0\u67E5\u8FDE\u63A5\u3002"));
+  async run(send, automatic = false) {
+    if (this.busy || !this.active) {
+      if (!automatic && this.active) new import_obsidian2.Notice(t("A sync or connection check is already running.", "\u6B63\u5728\u540C\u6B65\u6216\u68C0\u67E5\u8FDE\u63A5\u3002"));
       return;
     }
     const connection = this.connection();
     if (!connection) {
-      new import_obsidian.Notice(t(
+      if (!automatic) new import_obsidian2.Notice(t(
         "Open Settings \u2192 Vault Branch Sync to connect a private GitHub repository.",
         "\u8BF7\u5148\u5728\u300C\u8BBE\u7F6E \u2192 Vault Branch Sync\u300D\u8FDE\u63A5\u81EA\u5DF1\u7684 GitHub \u79C1\u6709\u4ED3\u5E93\u3002"
       ), 9e3);
@@ -1158,7 +1462,23 @@ var VaultBranchSync = class extends import_obsidian.Plugin {
       const target = { repository: connection.repository, branch: connection.branch };
       const scope = fileScope(connection.settings, this.app.vault.configDir);
       const api = this.client(target, token, scope), adapter = vaultFiles(this.app, scope);
-      notice = new import_obsidian.Notice(t("Reading branch\u2026", "\u6B63\u5728\u8BFB\u53D6\u5206\u652F\u2026"), 0);
+      if (!automatic) notice = new import_obsidian2.Notice(t("Reading branch\u2026", "\u6B63\u5728\u8BFB\u53D6\u5206\u652F\u2026"), 0);
+      const review = (plan) => {
+        if (!this.active) return null;
+        if (automatic) return { selected: /* @__PURE__ */ new Set(), conflicts: /* @__PURE__ */ new Map() };
+        return new Promise((resolve) => {
+          this.reviewModal = new SyncReview(
+            this.app,
+            plan,
+            (change) => compareNote(change, adapter, api, plan.remoteSize(change.path)),
+            (result) => {
+              this.reviewModal = null;
+              resolve(result);
+            }
+          );
+          this.reviewModal.open();
+        });
+      };
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
           const result = await synchronize({
@@ -1166,26 +1486,44 @@ var VaultBranchSync = class extends import_obsidian.Plugin {
             api,
             scope,
             target,
-            send,
+            send: send && !automatic,
+            fastReceive: automatic,
+            review,
             state: this.app.loadLocalStorage(baselineKey),
-            save: (state) => this.app.saveLocalStorage(baselineKey, state),
-            confirm: (changes) => new Promise((resolve) => new Conflicts(this.app, changes, resolve).open()),
-            progress: (message) => notice.setMessage(message)
+            save: (value) => this.app.saveLocalStorage(baselineKey, value),
+            progress: (message) => notice?.setMessage(message)
           });
           if (result.canceled) {
-            new import_obsidian.Notice(t("Sync canceled.", "\u5DF2\u53D6\u6D88\u540C\u6B65\u3002"));
+            if (this.active && !automatic) new import_obsidian2.Notice(t("Sync canceled.", "\u5DF2\u53D6\u6D88\u540C\u6B65\u3002"));
             return;
           }
-          const prefix = result.first ? t("First download complete", "\u9996\u6B21\u63A5\u6536\u5B8C\u6210") : t("Sync complete", "\u540C\u6B65\u5B8C\u6210");
-          new import_obsidian.Notice(prefix + t(" \xB7 Received ", " \xB7 \u63A5\u6536 ") + result.received + t(", sent ", "\uFF0C\u63D0\u4EA4 ") + result.sent + (result.copies ? t(". Local copies are in Sync conflicts.", "\u3002\u672C\u5730\u526F\u672C\u5728 Sync conflicts\u3002") : ""), 8e3);
+          const previous = this.app.loadLocalStorage(statusKey);
+          const { received, sent, deferred } = result;
+          this.app.saveLocalStorage(statusKey, {
+            lastSuccess: deferred ? previous?.lastSuccess ?? null : Date.now(),
+            received,
+            sent,
+            deferred
+          });
+          this.lastError = null;
+          this.refreshStatus();
+          if (this.active && (!automatic || received || deferred && deferred !== previous?.deferred)) {
+            let message = result.first ? t("First download complete", "\u9996\u6B21\u63A5\u6536\u5B8C\u6210") : t("Sync finished", "\u540C\u6B65\u5B8C\u6210");
+            message += t(" \xB7 Received ", " \xB7 \u63A5\u6536 ") + received + t(", committed ", "\uFF0C\u63D0\u4EA4 ") + sent;
+            if (deferred) message += t(" \xB7 Review conflicts: ", " \xB7 \u5F85\u5904\u7406\u51B2\u7A81 ") + deferred;
+            if (result.copies) message += t(" \xB7 Local copies in Sync conflicts", " \xB7 \u672C\u673A\u526F\u672C\u5DF2\u5B58\u5165 Sync conflicts");
+            new import_obsidian2.Notice(message, 8e3);
+          }
           return;
         } catch (error) {
-          if (!(error instanceof HeadMoved) || attempt) throw error;
-          notice.setMessage(t("Another device pushed. Comparing again\u2026", "\u53E6\u4E00\u53F0\u8BBE\u5907\u521A\u521A\u63A8\u9001\uFF0C\u6B63\u5728\u91CD\u65B0\u6BD4\u8F83\u2026"));
+          if (!(error instanceof HeadMoved) || attempt || !this.active) throw error;
+          notice?.setMessage(t("Another device pushed. Comparing again\u2026", "\u53E6\u4E00\u53F0\u8BBE\u5907\u521A\u521A\u63A8\u9001\uFF0C\u6B63\u5728\u91CD\u65B0\u6BD4\u8F83\u2026"));
         }
       }
     } catch (error) {
-      new import_obsidian.Notice(error.message, 1e4);
+      this.lastError = error.message;
+      this.refreshStatus();
+      if (this.active && !automatic) new import_obsidian2.Notice(error.message, 1e4);
     } finally {
       notice?.hide();
       this.busy = false;

@@ -7,13 +7,15 @@ Sync notes and attachments between desktop and mobile through a private GitHub r
 1. Use Obsidian 1.11.4 or later. Install **Vault Branch Sync** and enable it under **Community plugins**. To install a GitHub release manually, place its `main.js` and `manifest.json` together in `.obsidian/plugins/vault-branch-sync/`, then reload Obsidian. [Download a release](https://github.com/feichai0017/vault-branch-sync/releases/latest)
 2. Create a **private** GitHub repository for the vault, or choose an existing private repository. The default branch of an empty repository works too. To sync with a different branch, create it on GitHub first.
 3. In **Settings → Vault Branch Sync**, enter `owner/repository`. Leave **Branch** blank to use the repository's default branch. Create a fine-grained GitHub token, select only this repository and grant **Contents → Read and write**. Paste the token into the plugin and select **Save connection**. [GitHub token instructions](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)
-4. Select **Receive changes** on each device. The first sync downloads the branch and preserves local-only files. For a new empty repository, select **Sync now** on the device that has your notes to create the first commit. A switch to another repository, branch or file scope starts with another download.
+4. Select **Receive changes** on each device. The first sync downloads the branch and preserves local drafts. For an empty repository, then select **Review changes** on the device with your notes and choose the files for the first upload. A switch to another repository, branch or file scope starts with another download.
 
 ## Daily use
 
-Select **Receive changes** when moving to another device. After writing, click the sync icon or run **Vault Branch Sync: Sync with GitHub** in the command palette. When GitHub receives your commit, another device can pull it. An interrupted operation can be retried.
+After writing, click the sync icon or run **Vault Branch Sync: Sync with GitHub**. The preview lists incoming files and local additions, edits and deletions. Select the files to commit, then choose **Apply choices**. For example, select a paper note, its figure and its index. Unchecked drafts stay on the device and appear in the next preview. **Cancel** closes the preview before any files change.
 
-If the same file changed on both devices, you see its path before anything replaces it. **Cancel** lets you review both sides. **Keep both** saves the local content in `Sync conflicts/` and uses GitHub's version at the original path. A remote deletion moves the local original to the vault trash. The conflict copy is eligible for your next full sync.
+In settings, enable **Receive when opening or returning to this vault** on each device where you want it. Opening the vault or returning to the app downloads incoming changes. Conflicting files wait for your decision. **Sync status on this device** and the **Show sync status** command show the last successful sync and the latest counts. The desktop status bar also shows the time. You can still select **Receive changes** manually.
+
+Choose a resolution separately for each conflict. **Compare paragraphs** shows the differing Markdown text on this device and GitHub. **Commit local version** submits the local file (or its deletion). During a receive-only sync, **Keep local change for a later commit** leaves the edit available in the next upload preview. **Use GitHub version** applies the remote change to the original path. **Keep both** keeps a local copy in `Sync conflicts/` and applies the remote version at the original path. A remote deletion moves the original to the vault trash. **Decide later** carries this conflict into the next review while other files sync. Drawings and binary attachments support keeping both copies. Text previews cover up to 512 KiB per version.
 
 ## What travels
 
@@ -24,7 +26,7 @@ If the same file changed on both devices, you see its path before anything repla
 
 ## Network and privacy
 
-The plugin requires a GitHub account. On connection or manual sync it contacts `api.github.com` for repository metadata, file contents and Git commits. Your chosen repository must be private at connection and sync time. The plugin checks each downloaded file against its Git blob identifier. A branch update includes the revision it started from, so a newer push triggers a fresh comparison.
+The plugin contacts `api.github.com` when you connect, sync manually, or enable foreground receiving and return to the vault. Downloads use your chosen private repository. Uploading selected files requires a manual sync. The plugin verifies downloaded Git blobs and checks the expected branch revision before updating it. A newer push triggers a fresh comparison.
 
 Your token is kept in Obsidian's secret storage on the device. The connection and last-seen file revisions are local to the vault. The plugin has no telemetry, analytics or intermediary server.
 
