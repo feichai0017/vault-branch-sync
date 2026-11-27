@@ -1,10 +1,15 @@
-import {blobOid} from "./engine.js";
+import {blobOid} from "./oid.js";
 
-const maxPreviewBytes = 512 * 1024;
+export const maxPreviewBytes = 512 * 1024;
 const maxCells = 160_000;
 
 export function isMarkdownNote(path) {
     return /\.md$/i.test(path) && !/\.excalidraw\.md$/i.test(path);
+}
+
+export function isDrawingText(text) {
+    const header = text.slice(0, 2000).replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").split("\n---")[0];
+    return header.startsWith("---\n") && /^excalidraw-plugin:/m.test(header);
 }
 
 export function compareParagraphs(local, remote) {
@@ -65,10 +70,6 @@ export async function compareNote(change, adapter, api, remoteSize) {
         right = remote ? decoder.decode(remote) : "";
     } catch { return {kind: "attachment"}; }
     // Some Excalidraw drawings use a plain .md extension.
-    const drawing = text => {
-        const header = text.slice(0, 2000).replace(/\r\n/g, "\n").split("\n---")[0];
-        return header.startsWith("---\n") && /^excalidraw-plugin:/m.test(header);
-    };
-    if (drawing(left) || drawing(right)) return {kind: "attachment"};
+    if (isDrawingText(left) || isDrawingText(right)) return {kind: "attachment"};
     return compareParagraphs(left, right);
 }

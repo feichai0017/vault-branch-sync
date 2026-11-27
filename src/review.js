@@ -44,11 +44,12 @@ function renderComparison(el, comparison) {
 }
 
 export class SyncReview extends Modal {
-    constructor(app, plan, compare, finish) {
+    constructor(app, plan, compare, finish, figures = () => []) {
         super(app);
         this.plan = plan;
         this.compare = compare;
         this.finish = finish;
+        this.figures = figures;
         this.selected = new Set();
         this.conflicts = new Map();
         this.result = null;
@@ -72,29 +73,57 @@ export class SyncReview extends Modal {
         }
         this.actions = new Setting(el)
             .addButton(b => b.setButtonText(t("Cancel", "取消")).onClick(() => this.close()))
-            .addButton(b => b.setButtonText(t("Apply choices", "应用选择")).setCta().onClick(() => {
+            .addButton(b => { this.applyButton = b.setButtonText(t("Apply choices", "应用选择")).setCta().onClick(() => {
                 this.result = {selected: this.selected, conflicts: this.conflicts};
                 this.close();
-            }));
+            }); });
         this.actions.descEl.setAttribute("aria-live", "polite");
         this.updateCount();
     }
 
     updateCount() {
-        if (!this.actions || !this.plan.canSend) return;
-        const localConflicts = [...this.conflicts.values()].filter(choice => choice === "local").length;
+        if (!this.actions) return;
+        const unresolved = [...this.conflicts.values()].some(choice => choice?.kind === "merge" &&
+            choice.sides.some(side => !side));
+        this.applyButton.setDisabled(unresolved);
+        if (unresolved) {
+            this.actions.setDesc(t("Choose a version for each highlighted section.", "请为每处重叠修改选择一个版本。"));
+            return;
+        }
+        if (!this.plan.canSend) { this.actions.setDesc(""); return; }
+        const localConflicts = [...this.conflicts.values()].filter(choice => choice === "local" || choice?.send).length;
         this.actions.setDesc(t("Files to commit", "本次提交的文件") + " · " + (this.selected.size + localConflicts));
     }
 
     showOutgoing(el) {
         const toggles = new Map();
+        const cache = new Map();
+        const suggestions = el.createDiv();
+        const refreshFigures = () => {
+            suggestions.empty();
+            const related = new Set();
+            for (const path of this.selected) {
+                if (!cache.has(path)) cache.set(path, this.figures(path));
+                for (const figure of cache.get(path)) if (!this.selected.has(figure)) related.add(figure);
+            }
+            if (!related.size) return;
+            suggestions.createEl("h4", {text: t("Changed figures linked from selected notes", "已选笔记引用的改动配图")});
+            for (const path of [...related].sort()) {
+                new Setting(suggestions).setName(path).addButton(b => b.setButtonText(t("Include figure", "勾选配图"))
+                    .onClick(() => {
+                        this.selected.add(path);
+                        toggles.get(path).setValue(true);
+                        refreshFigures(); this.updateCount();
+                    }));
+            }
+        };
         const setAll = value => {
             this.selected.clear();
             for (const [path, toggle] of toggles) {
                 if (value) this.selected.add(path);
                 toggle.setValue(value);
             }
-            this.updateCount();
+            refreshFigures(); this.updateCount();
         };
         new Setting(el).setName(t("Commit to GitHub", "提交到 GitHub")).setHeading()
             .addButton(b => b.setButtonText(t("Select all", "全选")).onClick(() => setAll(true)))
@@ -105,7 +134,7 @@ export class SyncReview extends Modal {
                 toggle.setValue(false).onChange(value => {
                     if (value) this.selected.add(change.path);
                     else this.selected.delete(change.path);
-                    this.updateCount();
+                    refreshFigures(); this.updateCount();
                 });
                 toggle.toggleEl.setAttribute("aria-label", t("Commit ", "提交 ") + change.path);
             });
@@ -114,16 +143,50 @@ export class SyncReview extends Modal {
 
     showConflict(el, change) {
         const group = el.createDiv();
+        const model = this.plan.merges?.get(change.path);
+        const sides = Array(model?.overlaps || 0).fill(null);
+        let mergeControls;
         const states = t("This device", "本机") + " · " + editLabel(change.before, change.here) + " / GitHub · " + editLabel(change.before, change.there);
         new Setting(group).setName(change.path).setDesc(states).addDropdown(input => {
             input.addOption("later", t("Decide later", "稍后处理"));
+            if (model) {
+                input.addOption("merge", t("Merge on this device", "合并到本机"));
+                if (this.plan.canSend) input.addOption("merge-send", t("Merge and commit", "合并并提交"));
+            }
             input.addOption("both", t("Keep both", "保留两份"));
             input.addOption("remote", change.there ? t("Use GitHub version", "采用 GitHub 版本") : t("Apply GitHub deletion", "采用 GitHub 的删除"));
             if (this.plan.canSend) input.addOption("local", change.here ? t("Commit local version", "提交本机版本") : t("Commit local deletion", "提交本机的删除"));
             else input.addOption("keep-local", t("Keep local change for a later commit", "保留本机改动，稍后提交"));
-            input.setValue("later").onChange(value => { this.conflicts.set(change.path, value); this.updateCount(); });
+            const choose = value => {
+                const merging = value === "merge" || value === "merge-send";
+                this.conflicts.set(change.path, merging ? {kind: "merge", sides, send: value === "merge-send"} : value);
+                if (mergeControls) mergeControls.hidden = !merging;
+                this.updateCount();
+            };
+            const initial = model?.overlaps === 0 ? "merge" : "later";
+            input.setValue(initial).onChange(choose);
+            choose(initial);
             input.selectEl.setAttribute("aria-label", t("Resolve ", "处理冲突 ") + change.path);
         });
+        if (model) {
+            mergeControls = group.createDiv();
+            mergeControls.hidden = model.overlaps > 0;
+            if (!model.overlaps) mergeControls.createEl("p", {text: t("Independent edits will be combined. You can commit the result later.",
+                "两端改动可以自动合并。合并到本机后，可在下次预览时勾选提交。")});
+            for (const part of model.parts.filter(item => !item.lines)) {
+                const hunk = mergeControls.createDiv();
+                hunk.createEl("strong", {text: t("Overlapping edit at base line ", "重叠修改，共同版本第 ") + part.line});
+                for (const [key, label] of [["base", t("Last synced", "上次同步")], ["local", t("This device", "本机")], ["remote", "GitHub"]]) {
+                    hunk.createEl("small", {text: label});
+                    hunk.createEl("pre", {text: part[key].length ? part[key].join("\n") : t("(no lines)", "（无内容）")});
+                }
+                new Setting(hunk).setName(t("Keep in merged note", "此处保留")).addDropdown(control => {
+                    control.addOption("", t("Choose a version", "请选择"))
+                        .addOption("local", t("This device", "本机")).addOption("remote", "GitHub")
+                        .onChange(value => { sides[part.index] = value || null; this.updateCount(); });
+                });
+            }
+        }
         if (!isMarkdownNote(change.path)) return;
         const details = group.createEl("details");
         details.createEl("summary", {text: t("Compare paragraphs", "比较段落")});

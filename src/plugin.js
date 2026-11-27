@@ -1,5 +1,7 @@
-import {Notice, Platform, Plugin, PluginSettingTab, Setting, TextFileView, TFolder, arrayBufferToBase64, getLanguage, requestUrl} from "obsidian";
-import {compareNote} from "./compare.js";
+import {Notice, Platform, Plugin, PluginSettingTab, Setting, TextFileView, TFolder, arrayBufferToBase64, getLanguage, parseLinktext, requestUrl} from "obsidian";
+import {relatedFigures} from "./attachments.js";
+import {compareNote, isMarkdownNote} from "./compare.js";
+import {NoteHistory} from "./history-modal.js";
 import {SyncReview, t} from "./review.js";
 import {HeadMoved, synchronize} from "./engine.js";
 import {GitHub} from "./github.js";
@@ -27,6 +29,14 @@ function vaultFiles(app, scope) {
         },
         stat: path => disk.stat(path), exists: path => disk.exists(path),
         read: path => disk.read(path), readBinary: path => disk.readBinary(path),
+        async mergeText(path, original, merged) {
+            const file = vault.getFileByPath(path);
+            if (!file) throw new Error("Moved during merge: " + path);
+            await vault.process(file, current => {
+                if (current !== original) throw new Error("Edited during merge: " + path);
+                return merged;
+            });
+        },
         async flush(path) {
             const view = app.workspace.getActiveViewOfType(TextFileView);
             if (view?.file && (!path || view.file.path === path)) await view.save(false);
@@ -114,6 +124,17 @@ export default class VaultBranchSync extends Plugin {
         this.addCommand({id: "sync", name: t("Sync with GitHub", "与 GitHub 同步"), callback: () => this.run(true)});
         this.addCommand({id: "receive", name: t("Receive changes from GitHub", "仅接收 GitHub 更新"), callback: () => this.run(false)});
         this.addCommand({id: "show-status", name: t("Show sync status", "查看同步状态"), callback: () => new Notice(this.statusText(), 8000)});
+        const historyTitle = t("View note history on GitHub", "查看本篇 GitHub 历史");
+        this.addCommand({id: "note-history", name: historyTitle, checkCallback: checking => {
+            const file = this.app.workspace.getActiveFile();
+            if (!file || !isMarkdownNote(file.path)) return false;
+            if (!checking) this.openHistory(file);
+            return true;
+        }});
+        this.registerEvent(this.app.workspace.on("file-menu", (menu, file) => {
+            if (file.extension && isMarkdownNote(file.path)) menu.addItem(item => item.setTitle(historyTitle)
+                .setIcon("history").onClick(() => this.openHistory(file)));
+        }));
         this.app.workspace.onLayoutReady(() => {
             if (!this.active) return;
             this.doc = this.app.workspace.containerEl.ownerDocument;
@@ -129,6 +150,7 @@ export default class VaultBranchSync extends Plugin {
         this.active = false;
         this.win?.clearTimeout(this.autoTimer);
         this.reviewModal?.close();
+        this.historyModal?.close();
     }
 
     autoEnabled() { return this.app.loadLocalStorage(autoKey) === true; }
@@ -151,6 +173,7 @@ export default class VaultBranchSync extends Plugin {
         if (status) {
             text += t(" | Last check: received ", " | 上次检查接收 ") + status.received + t(", committed ", "，提交 ") + status.sent;
             if (status.deferred) text += t(", conflicts to review ", "，待处理冲突 ") + status.deferred;
+            if (status.merged) text += t(", merged ", "，已合并 ") + status.merged;
         }
         if (this.lastError) text += " | " + this.lastError;
         return text;
@@ -169,6 +192,19 @@ export default class VaultBranchSync extends Plugin {
     }
 
     connection() { return this.app.loadLocalStorage(connectionKey); }
+
+    openHistory(file) {
+        const target = this.connection();
+        const token = target && this.app.secretStorage.getSecret(target.secretId);
+        if (!token) {
+            new Notice(t("Connect this device in Settings → Vault Branch Sync first.", "请先到「设置 → Vault Branch Sync」连接本设备。"));
+            return;
+        }
+        this.historyModal?.close();
+        const api = this.client(target, token, fileScope(target.settings, this.app.vault.configDir));
+        this.historyModal = new NoteHistory(this.app, file, api);
+        this.historyModal.open();
+    }
 
     client(target, token, scope) {
         return new GitHub(target, token, async options => {
@@ -227,10 +263,20 @@ export default class VaultBranchSync extends Plugin {
             const review = plan => {
                 if (!this.active) return null;
                 if (automatic) return {selected: new Set(), conflicts: new Map()};
+                const eligible = new Set(plan.outgoing.filter(change => change.here).map(change => change.path));
+                const {metadataCache, vault} = this.app;
+                const meta = path => {
+                    const file = vault.getFileByPath(path);
+                    return file && metadataCache.getFileCache(file);
+                };
                 return new Promise(resolve => {
                     this.reviewModal = new SyncReview(this.app, plan,
                         change => compareNote(change, adapter, api, plan.remoteSize(change.path)),
-                        result => { this.reviewModal = null; resolve(result); });
+                        result => { this.reviewModal = null; resolve(result); },
+                        path => relatedFigures(path, eligible, meta(path),
+                            (link, source) => metadataCache.getFirstLinkpathDest(parseLinktext(link).path, source)?.path,
+                            path => /\.excalidraw(?:\.md)?$/i.test(path) ||
+                                Boolean(/\.md$/i.test(path) && meta(path)?.frontmatter?.["excalidraw-plugin"])));
                     this.reviewModal.open();
                 });
             };
@@ -247,7 +293,7 @@ export default class VaultBranchSync extends Plugin {
                     const previous = this.app.loadLocalStorage(statusKey);
                     const {received, sent, deferred} = result;
                     this.app.saveLocalStorage(statusKey, {
-                        lastSuccess: deferred ? previous?.lastSuccess ?? null : Date.now(), received, sent, deferred
+                        lastSuccess: deferred ? previous?.lastSuccess ?? null : Date.now(), received, sent, deferred, merged: result.merged || 0
                     });
                     this.lastError = null;
                     this.refreshStatus();
@@ -255,6 +301,7 @@ export default class VaultBranchSync extends Plugin {
                         let message = result.first ? t("First download complete", "首次接收完成") : t("Sync finished", "同步完成");
                         message += t(" · Received ", " · 接收 ") + received + t(", committed ", "，提交 ") + sent;
                         if (deferred) message += t(" · Review conflicts: ", " · 待处理冲突 ") + deferred;
+                        if (result.merged) message += t(" · Merged ", " · 已合并 ") + result.merged;
                         if (result.copies) message += t(" · Local copies in Sync conflicts", " · 本机副本已存入 Sync conflicts");
                         new Notice(message, 8000);
                     }

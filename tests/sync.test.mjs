@@ -235,6 +235,55 @@ test("selecting the default branch handles empty repositories and escapes nested
 
 const choose = (paths = [], conflicts = []) => ({selected: new Set(paths), conflicts: new Map(conflicts)});
 
+test("automatic receive merges separate edits locally and a later selection commits only the reviewed result", async t => {
+    const [r, d] = await setup(t);
+    r.set("Paper.md","Formula"); await d.sync(r);
+    await d.file("Paper.md","Formula\n\nMy thoughts"); await d.file("draft.md","unselected");
+    r.set("Paper.md","Fixed formula");
+    const head = await r.head();
+    const merged = await d.sync(r, {send:false, fastReceive:true, review:() => {throw Error("clean receive needs no dialog");}});
+    assert.equal(merged.merged,1); assert.equal(merged.sent,0); assert.equal(merged.pending,2);
+    assert.equal(await r.head(),head); assert.equal(await d.text("Paper.md"),"Fixed formula\n\nMy thoughts");
+    assert.equal(new Map(d.state.files).get("Paper.md"),oid("Fixed formula"));
+    await d.sync(r, {review:plan => {assert.equal(plan.conflicts.length,0); return choose(["Paper.md"]);}});
+    assert.equal(r.files.get("Paper.md"),oid("Fixed formula\n\nMy thoughts")); assert(!r.files.has("draft.md"));
+});
+
+test("manual merge supports per-hunk choices, cancellation and receive-only restrictions", async t => {
+    const [r, d] = await setup(t);
+    r.set("N.md","one\n\nnext"); await d.sync(r);
+    await d.file("N.md","my one\n\nnext\n\nend"); r.set("N.md","their one\n\nnext");
+    const head = await r.head();
+    assert((await d.sync(r, {review:() => null})).canceled);
+    await assert.rejects(d.sync(r, {review:() => choose([], [["N.md",{kind:"merge",sides:[]} ]])}), /every/);
+    await assert.rejects(d.sync(r, {send:false,review:() => choose([], [["N.md",{kind:"merge",sides:["remote"],send:true}]])}), /Invalid/);
+    assert.equal(await r.head(),head); assert.equal(await d.text("N.md"),"my one\n\nnext\n\nend");
+    const result=await d.sync(r, {review:plan => {
+        assert.equal(plan.merges.get("N.md").overlaps,1);
+        return choose([], [["N.md",{kind:"merge",sides:["remote"],send:true}]]);
+    }});
+    assert.equal(result.sent,1); assert.equal(await d.text("N.md"),"their one\n\nnext\n\nend");
+    assert.equal(r.files.get("N.md"),oid(await d.text("N.md")));
+});
+
+test("failed commit after a local merge is retryable and newer typing or head changes invalidate review", async t => {
+    const [r,d]=await setup(t);
+    r.set("N.md","one\n\nbase"); await d.sync(r);
+    await d.file("N.md","one\n\nmine"); r.set("N.md","two\n\nbase");
+    const decision=()=>choose([], [["N.md",{kind:"merge",send:true}]]);
+    await assert.rejects(d.sync(r, {review:() => {r.set("Other.md","someone pushed"); return decision();}}), HeadMoved);
+    await assert.rejects(d.sync(r, {review:async () => {await d.file("N.md","one\n\nnew typing"); return decision();}}), /Edited/);
+    assert.equal(await d.text("N.md"),"one\n\nnew typing");
+    const commit=r.commit.bind(r);
+    r.commit=async () => {throw Error("offline");};
+    await assert.rejects(d.sync(r, {review:decision}), /offline/);
+    assert.equal(await d.text("N.md"),"two\n\nnew typing");
+    assert.equal(new Map(d.state.files).get("N.md"),r.files.get("N.md"));
+    r.commit=commit;
+    const result=await d.sync(r, {review:plan => {assert.equal(plan.conflicts.length,0); return choose(["N.md"]);}});
+    assert.equal(result.sent,1);assert.equal(r.files.get("N.md"),oid("two\n\nnew typing"));
+});
+
 test("review commits only the chosen note, index and image and still receives other changes", async t => {
     const [r, mac, phone] = await setup(t, 2);
     r.set("Index.md", "old"); r.set("Archive.md", "keep"); r.set("Updates.md", "old");

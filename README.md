@@ -13,9 +13,21 @@ Sync notes and attachments between desktop and mobile through a private GitHub r
 
 After writing, click the sync icon or run **Vault Branch Sync: Sync with GitHub**. The preview lists incoming files and local additions, edits and deletions. Select the files to commit, then choose **Apply choices**. For example, select a paper note, its figure and its index. Unchecked drafts stay on the device and appear in the next preview. **Cancel** closes the preview before any files change.
 
-In settings, enable **Receive when opening or returning to this vault** on each device where you want it. Opening the vault or returning to the app downloads incoming changes. Conflicting files wait for your decision. **Sync status on this device** and the **Show sync status** command show the last successful sync and the latest counts. The desktop status bar also shows the time. You can still select **Receive changes** manually.
+When you select a note, **Changed figures linked from selected notes** lists eligible new or edited pictures. Choose **Include figure** for each file you want. Links and embeds are resolved from the note's location. A linked Excalidraw source or SVG can also suggest its changed counterpart.
+
+In settings, enable **Receive when opening or returning to this vault** on each device where you want it. Opening the vault or returning to the app downloads incoming changes. Independent Markdown edits merge on this device. Overlapping edits wait for your decision. **Sync status on this device** and the **Show sync status** command show the last successful sync and the latest counts. The desktop status bar also shows the time.
+
+### Merge two edits to a note
+
+The last synced Git blob is the common ancestor. If a laptop fixes a formula and a phone adds a paragraph, receiving combines the two changes locally. Select the resulting note in the next upload preview to publish it. In a manual sync, **Merge and commit** also lets you publish the result in the same operation.
+
+When changes overlap, choose **Merge on this device** or **Merge and commit**. Each overlapping section shows the last synced lines, this device's lines and the GitHub lines. Choose a side for each section and select **Apply choices**. Non-overlapping edits are retained. Whole-file choices remain available for drawings, delete/edit conflicts and notes without a common version. Three-way text merging supports UTF-8 notes with consistent line endings, up to 512 KiB and 10,000 lines per version.
 
 Choose a resolution separately for each conflict. **Compare paragraphs** shows the differing Markdown text on this device and GitHub. **Commit local version** submits the local file (or its deletion). During a receive-only sync, **Keep local change for a later commit** leaves the edit available in the next upload preview. **Use GitHub version** applies the remote change to the original path. **Keep both** keeps a local copy in `Sync conflicts/` and applies the remote version at the original path. A remote deletion moves the original to the vault trash. **Decide later** carries this conflict into the next review while other files sync. Drawings and binary attachments support keeping both copies. Text previews cover up to 512 KiB per version.
+
+### Restore an earlier version
+
+With a Markdown note open, run **View note history on GitHub** from the command palette or its file menu. Select **Preview** beside a commit and **Restore as a copy**. The copy is placed beside your note and includes the short commit ID in its name. Existing copies keep their contents. The history lists commits for the note's current path on the connected branch, 20 at a time. Copies remain local until you select them for a commit.
 
 ## What travels
 
@@ -26,7 +38,7 @@ Choose a resolution separately for each conflict. **Compare paragraphs** shows t
 
 ## Network and privacy
 
-The plugin contacts `api.github.com` when you connect, sync manually, or enable foreground receiving and return to the vault. Downloads use your chosen private repository. Uploading selected files requires a manual sync. The plugin verifies downloaded Git blobs and checks the expected branch revision before updating it. A newer push triggers a fresh comparison.
+The plugin contacts `api.github.com` when you connect, sync, view note history or restore a revision. Downloads use your chosen private repository. Uploading selected files requires a manual sync. The plugin verifies downloaded Git blobs and checks the expected branch revision before updating it. A newer push triggers a fresh comparison.
 
 Your token is kept in Obsidian's secret storage on the device. The connection and last-seen file revisions are local to the vault. The plugin has no telemetry, analytics or intermediary server.
 
@@ -40,7 +52,7 @@ npm test
 npm run build
 ```
 
-The build writes `main.js` beside `manifest.json`. The tests use disposable folders and synthetic vault files. They cover interrupted downloads, empty repositories, concurrent pushes, delete/edit conflicts, branch selection and file exclusions. [MIT license](LICENSE) · [node-ignore, included under MIT](https://github.com/kaelzhang/node-ignore)
+The build writes `main.js` beside `manifest.json`. Tests use disposable folders and synthetic vault files, including two-device merges, interrupted transfers, history restores and figure selection. [MIT license](LICENSE) · [node-ignore](https://github.com/kaelzhang/node-ignore) · [node-diff3](https://github.com/bhousel/node-diff3)
 
 ## Verify a release
 

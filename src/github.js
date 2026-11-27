@@ -79,6 +79,25 @@ export class GitHub {
         return bytes;
     }
 
+    async noteHistory(path, head, page = 1) {
+        if (!this.scope.allowed(path) || !Number.isSafeInteger(page) || page < 1) throw new Error("Invalid note history request.");
+        const query = new URLSearchParams({sha: checkedOid(head), path, per_page: "20", page: String(page)});
+        const rows = await this.call(this.root + "/commits?" + query);
+        return rows.map(row => ({sha: checkedOid(row.sha), message: row.commit.message.split("\n")[0],
+            date: row.commit.author?.date || row.commit.committer?.date || ""}));
+    }
+
+    async noteRevision(path, commit) {
+        if (!this.scope.allowed(path)) throw new Error("This path is outside the sync scope.");
+        let item;
+        try { item = await this.call(this.root + "/contents/" + encodePath(path) + "?ref=" + checkedOid(commit)); }
+        catch (error) { if (error.status === 404) return null; throw error; }
+        if (item.type !== "file" || item.path !== path || item.submodule_git_url || item.target) {
+            throw new Error("This revision is not a regular file.");
+        }
+        return {sha: checkedOid(item.sha), size: item.size};
+    }
+
     async allEntries(tree) {
         const answer = await this.call(this.root + "/git/trees/" + tree + "?recursive=1");
         if (!answer.truncated) return answer.tree;

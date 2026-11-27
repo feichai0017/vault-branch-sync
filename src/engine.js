@@ -1,18 +1,8 @@
 import ignore from "ignore";
 import {fileScope, sameTarget} from "./target.js";
-
-const utf8 = new TextEncoder();
-export const validOid = value => typeof value === "string" && /^[a-f0-9]{40}$/.test(value);
-
-export async function blobOid(data) {
-    const bytes = new Uint8Array(data);
-    const header = utf8.encode("blob " + bytes.length + "\0");
-    const blob = new Uint8Array(header.length + bytes.length);
-    blob.set(header);
-    blob.set(bytes, header.length);
-    const digest = new Uint8Array(await crypto.subtle.digest("SHA-1", blob));
-    return Array.from(digest, n => n.toString(16).padStart(2, "0")).join("");
-}
+import {blobOid, validOid} from "./oid.js";
+import {mergeResult, prepareMerge} from "./merge.js";
+export {blobOid, validOid} from "./oid.js";
 
 export function fromState(state, target, scope) {
     if (!state || state.version !== 1 || !sameTarget(state, target) ||
@@ -209,26 +199,45 @@ export async function synchronize({adapter, api, target, state, scope = fileScop
     checkNames(new Set([...local.keys(), ...remote.keys()]));
     const plan = planChanges(base, local, remote, true);
     const canSend = send && !first;
+    const merges = new Map();
+    for (const change of plan.conflicts) {
+        const model = await prepareMerge(change, adapter, api, snapshot.entries.get(change.path)?.size);
+        if (model) merges.set(change.path, model);
+    }
     let decision = {selected: new Set(), conflicts: new Map()};
-    if (plan.conflicts.length || (canSend && (plan.incoming.length || plan.outgoing.length))) {
+    if (plan.conflicts.some(change => canSend || merges.get(change.path)?.overlaps !== 0) ||
+        (canSend && (plan.incoming.length || plan.outgoing.length))) {
         decision = await review({
             incoming: plan.incoming,
             outgoing: canSend ? plan.outgoing : [],
             conflicts: plan.conflicts,
+            merges,
             canSend,
             remoteSize: path => snapshot.entries.get(path)?.size
         });
         if (!decision) return {canceled: true};
-        if (await api.head() !== snapshot.head) throw new HeadMoved("The remote branch changed during review.");
     }
+    if ((plan.conflicts.length || canSend && (plan.incoming.length || plan.outgoing.length)) &&
+        await api.head() !== snapshot.head) throw new HeadMoved("The remote branch changed during review.");
 
     const outgoing = canSend ? plan.outgoing.filter(change => decision.selected.has(change.path)) : [];
     let pending = plan.outgoing.length - outgoing.length;
     const inbound = [...plan.incoming], keepBoth = [], intended = new Map(remote);
-    let deferred = 0;
+    let deferred = 0, merged = 0;
     for (const change of plan.conflicts) {
-        const choice = decision.conflicts.get(change.path) ?? "later";
-        if (choice === "later") {
+        const model = merges.get(change.path);
+        const choice = decision.conflicts.get(change.path) ?? (model?.overlaps === 0 ? {kind: "merge"} : "later");
+        if (choice?.kind === "merge" && model && (!choice.send || canSend)) {
+            const text = mergeResult(model, choice.sides);
+            const data = new TextEncoder().encode(text).buffer;
+            const sha = await blobOid(data);
+            inbound.push({...change, merge: {text, data, sha, original: model.originalLocal}});
+            if (sha !== change.there) {
+                if (choice.send) outgoing.push({...change, here: sha});
+                else pending++;
+            }
+            merged++;
+        } else if (choice === "later") {
             // A deferred conflict keeps its common ancestor across syncs, even when the branch advances.
             setRevision(intended, change.path, change.before);
             deferred++;
@@ -252,7 +261,16 @@ export async function synchronize({adapter, api, target, state, scope = fileScop
     try {
         for (const change of inbound) {
             progress("Receiving " + (received + 1) + "/" + inbound.length + " · " + change.path);
-            await applyRemote(adapter, api, change);
+            if (change.merge) {
+                await adapter.flush?.(change.path);
+                const {text, data, sha, original} = change.merge;
+                if (adapter.mergeText) await adapter.mergeText(change.path, original, text);
+                else {
+                    if (await currentOid(adapter, change.path) !== change.here) throw new Error("Edited during merge: " + change.path);
+                    await adapter.writeBinary(change.path, data);
+                }
+                if (await currentOid(adapter, change.path) !== sha) throw new Error("Merged text changed before verification: " + change.path);
+            } else await applyRemote(adapter, api, change);
             if (acknowledged) setRevision(acknowledged, change.path, change.there);
             received++;
         }
@@ -297,5 +315,5 @@ export async function synchronize({adapter, api, target, state, scope = fileScop
         throw new HeadMoved("The remote branch changed.");
     }
     await save(baseline(head, intended, deferred === 0));
-    return {first, head, received, sent, pending, copies: keepBoth.length, deferred, conflicts: plan.conflicts.length};
+    return {first, head, received, sent, pending, merged, copies: keepBoth.length, deferred, conflicts: plan.conflicts.length};
 }
