@@ -31,7 +31,9 @@ With a Markdown note open, run **View note history on GitHub** from the command 
 
 ## Use the Git plugin on a desktop checkout
 
-If the vault root is a Git checkout, enable the **Git** community plugin and turn on **Use the Git plugin on this computer** in Vault Branch Sync. The sync icon now opens Git's Source Control panel. Select a filename to see its diff. Stage individual files with **+**, run **Git: Commit staged**, then **Git: Push**. To see changes alongside an open note, run **Vault Branch Sync: View Git diff for current file**, or enable Git's editor gutter for inline change markers. [Git plugin](https://github.com/Vinzent03/obsidian-git)
+If the vault root is a Git checkout, enable the **Git** community plugin and turn on **Use the Git plugin on this computer** in Vault Branch Sync. Click the **Git** ribbon icon to review a diff and stage files with **+**. Git's editor gutter can also stage individual hunks. Click the **Sync** ribbon icon once to commit the current staging area with the Git plugin's configured message template and push to this branch's upstream. Later edits to a staged file stay in the working tree. A push also delivers earlier local commits on that branch. [Git plugin](https://github.com/Vinzent03/obsidian-git)
+
+With an empty staging area, Sync normally prompts you to stage changes. If its previous push failed, clicking Sync again retries the saved commit while the branch tip and upstream still match. If another device pushed first, fetch and review the remote changes in Git. After reconciling the branch, use **Git: Push**.
 
 **Receive changes** uses Git Pull for the checkout's active branch and configured upstream. Git controls automatic pulls on this computer. The separate GitHub connection is still used for note history. On a phone, the regular download and selective upload preview continue to use the private GitHub branch.
 

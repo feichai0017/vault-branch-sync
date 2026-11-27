@@ -550,6 +550,9 @@ __export(plugin_exports, {
 module.exports = __toCommonJS(plugin_exports);
 var import_obsidian3 = require("obsidian");
 
+// src/review.js
+var import_obsidian = require("obsidian");
+
 // src/oid.js
 var utf8 = new TextEncoder();
 var validOid = (value) => typeof value === "string" && /^[a-f0-9]{40}$/.test(value);
@@ -639,54 +642,7 @@ async function compareNote(change, adapter, api, remoteSize) {
   return compareParagraphs(left, right);
 }
 
-// src/attachments.js
-var picture = /\.(?:svg|png|jpe?g|webp|gif|bmp|avif|heic|tiff?)$/i;
-function relatedFigures(note, eligible, metadata, resolve, isDrawing) {
-  if (!isMarkdownNote(note) || isDrawing(note) || !metadata) return [];
-  const related = /* @__PURE__ */ new Set();
-  const add = (path) => {
-    if (eligible.has(path)) related.add(path);
-  };
-  for (const { link } of [...metadata.embeds || [], ...metadata.links || []]) {
-    const path = resolve(link, note);
-    if (!path) continue;
-    if (isDrawing(path)) {
-      add(path);
-      const stem = path.replace(/\.md$/i, "");
-      for (const name of /* @__PURE__ */ new Set([stem, stem.replace(/\.excalidraw$/i, "")])) {
-        for (const ending of [".svg", ".dark.svg", ".light.svg", ".png"]) add(name + ending);
-      }
-    } else if (picture.test(path)) {
-      add(path);
-      const stem = path.replace(/(?:\.(?:dark|light))?\.[^.]+$/i, "");
-      for (const candidate of [stem + ".md", stem + ".excalidraw.md", stem + ".excalidraw"]) {
-        if (eligible.has(candidate) && isDrawing(candidate)) add(candidate);
-      }
-    }
-  }
-  return [...related].sort();
-}
-
-// src/history-modal.js
-var import_obsidian2 = require("obsidian");
-
-// src/history.js
-async function restoreCopy(vault, originalPath, commit, bytes) {
-  if (!validOid(commit) || !/\.md$/i.test(originalPath)) throw new Error("Invalid Markdown revision.");
-  const stem = originalPath.slice(0, -3) + " (history " + commit.slice(0, 12);
-  for (let n = 1; ; n++) {
-    const path = stem + (n > 1 ? "-" + n : "") + ").md";
-    if (await vault.adapter.exists(path)) continue;
-    try {
-      return await vault.createBinary(path, bytes);
-    } catch (error) {
-      if (!await vault.adapter.exists(path)) throw error;
-    }
-  }
-}
-
 // src/review.js
-var import_obsidian = require("obsidian");
 var t = (en, zh) => (0, import_obsidian.getLanguage)().startsWith("zh") ? zh : en;
 function editLabel(before, after) {
   if (!after) return t("Deleted", "\u5220\u9664");
@@ -894,6 +850,122 @@ var SyncReview = class extends import_obsidian.Modal {
     this.finish(this.result);
   }
 };
+
+// src/desktop-git.js
+var pendingPrefix = "vault-branch-sync.pending-push.v1.";
+async function syncStaged(app, provider) {
+  const manager = provider.gitManager, git = manager?.git;
+  if (!git?.raw || !git.commit || !manager.status || !manager.formatCommitMessage) {
+    throw new Error(t(
+      "Desktop Git is not ready. Open Git's Source Control and try again.",
+      "\u684C\u9762 Git \u5C1A\u672A\u5C31\u7EEA\uFF0C\u8BF7\u5148\u6253\u5F00 Git \u66F4\u6539\u9762\u677F\u518D\u8BD5\u3002"
+    ));
+  }
+  const changes = await manager.status();
+  if (changes.conflicted.length || changes.conflictedOutsideVault) {
+    throw new Error(t("Resolve the Git conflicts before syncing staged changes.", "\u8BF7\u5148\u5728 Git \u9762\u677F\u89E3\u51B3\u5408\u5E76\u51B2\u7A81\uFF0C\u518D\u540C\u6B65\u6682\u5B58\u5185\u5BB9\u3002"));
+  }
+  if (changes.stagedOutsideVault) {
+    throw new Error(t(
+      "Files outside this vault are also staged. Review the Git staging area before syncing.",
+      "\u6682\u5B58\u533A\u91CC\u8FD8\u6709\u5E93\u5916\u6587\u4EF6\uFF0C\u8BF7\u5148\u5728 Git \u4E2D\u6838\u5BF9\u8981\u63D0\u4EA4\u7684\u8303\u56F4\u3002"
+    ));
+  }
+  let branch;
+  try {
+    branch = (await git.raw(["symbolic-ref", "--quiet", "HEAD"])).trim();
+  } catch {
+    throw new Error(t("Check out a local Git branch before syncing.", "\u8BF7\u5148\u5728 Git \u9762\u677F\u5207\u6362\u5230\u672C\u5730\u5206\u652F\u3002"));
+  }
+  const key = pendingPrefix + branch;
+  const pending = app.loadLocalStorage(key);
+  const staged = changes.staged.length > 0;
+  if (!staged && !pending) return t("Nothing staged. Use + in Git to select files or hunks.", "\u6682\u5B58\u533A\u4E3A\u7A7A\u3002\u5728 Git \u9762\u677F\u70B9 + \u9009\u6587\u4EF6\uFF0C\u6216\u5728\u7F16\u8F91\u5668\u91CC\u6682\u5B58\u67D0\u4E00\u6BB5\u3002");
+  const upstream = await git.raw(["for-each-ref", "--format=%(upstream:remotename)%00%(upstream:remoteref)", branch]);
+  const [remote, ref] = upstream.trimEnd().split("\0");
+  if (!remote || remote === "." || remote.startsWith("-") || !ref?.startsWith("refs/heads/")) {
+    throw new Error(t("Set an upstream remote branch in Git before syncing.", "\u8BF7\u5148\u7ED9\u5F53\u524D Git \u5206\u652F\u8BBE\u7F6E\u8981\u63A8\u9001\u7684\u8FDC\u7AEF\u8DDF\u8E2A\u5206\u652F\u3002"));
+  }
+  if (provider.settings.disablePush) {
+    throw new Error(t("Pushing is disabled in the Git plugin settings.", "Git \u63D2\u4EF6\u8BBE\u7F6E\u5DF2\u7981\u7528\u63A8\u9001\u3002"));
+  }
+  const urls = await git.raw(["remote", "get-url", "--push", "--all", "--", remote]);
+  const destination = await blobOid(new TextEncoder().encode(urls.trimEnd()));
+  let sha;
+  if (staged) {
+    const message = await manager.formatCommitMessage(provider.settings.commitMessage || t("Sync staged vault changes", "\u540C\u6B65\u5DF2\u6682\u5B58\u7684\u7B14\u8BB0"));
+    const result = await git.commit(message);
+    if (!result.commit) throw new Error(t("Git did not create a commit. Check the staging area.", "Git \u6CA1\u6709\u521B\u5EFA\u63D0\u4EA4\uFF0C\u8BF7\u68C0\u67E5\u6682\u5B58\u533A\u3002"));
+    sha = (await git.raw(["rev-parse", "--verify", result.commit + "^{commit}"])).trim();
+    app.saveLocalStorage(key, { remote, ref, sha, destination });
+    app.workspace.trigger("obsidian-git:head-change");
+  } else {
+    sha = pending.sha;
+  }
+  const tip = (await git.raw(["rev-parse", "--verify", branch])).trim();
+  if (tip !== sha || !staged && (pending.remote !== remote || pending.ref !== ref || pending.destination !== destination)) {
+    app.saveLocalStorage(key, null);
+    throw new Error(t(
+      "The branch or its upstream changed. Review the local commits in Git and use Push.",
+      "\u5206\u652F\u6216\u4E0A\u6E38\u5DF2\u6539\u53D8\uFF0C\u8BF7\u5148\u5728 Git \u9762\u677F\u6838\u5BF9\u672C\u5730\u63D0\u4EA4\uFF0C\u518D\u70B9 Push\u3002"
+    ));
+  }
+  try {
+    await git.raw(["push", "--no-follow-tags", "--recurse-submodules=no", remote, sha + ":" + ref]);
+  } catch (error) {
+    const divergence = /non-fast-forward|fetch first|\[rejected\]/i.test(error.message);
+    throw new Error(t("Local commit ", "\u672C\u5730\u63D0\u4EA4 ") + sha.slice(0, 7) + (divergence ? t(" was kept. The remote rejected the push. Fetch and review the branch in Git before pushing.", " \u5DF2\u4FDD\u7559\u3002\u8FDC\u7AEF\u62D2\u7EDD\u4E86\u63A8\u9001\uFF0C\u8BF7\u5728 Git \u9762\u677F\u83B7\u53D6\u5E76\u6838\u5BF9\u8FDC\u7AEF\u6539\u52A8\u540E\u518D\u63A8\u9001\u3002") : t(" was kept. Check the network and Git access, then click Sync to retry.", " \u5DF2\u4FDD\u7559\u3002\u68C0\u67E5\u7F51\u7EDC\u548C Git \u8BBF\u95EE\u6743\u9650\u540E\uFF0C\u518D\u70B9 Sync \u53EF\u91CD\u8BD5\u3002")));
+  }
+  app.saveLocalStorage(key, null);
+  app.workspace.trigger("obsidian-git:refs-changed");
+  return t("Pushed ", "\u5DF2\u63A8\u9001 ") + sha.slice(0, 7) + " \u2192 " + remote + "/" + ref.slice("refs/heads/".length);
+}
+
+// src/attachments.js
+var picture = /\.(?:svg|png|jpe?g|webp|gif|bmp|avif|heic|tiff?)$/i;
+function relatedFigures(note, eligible, metadata, resolve, isDrawing) {
+  if (!isMarkdownNote(note) || isDrawing(note) || !metadata) return [];
+  const related = /* @__PURE__ */ new Set();
+  const add = (path) => {
+    if (eligible.has(path)) related.add(path);
+  };
+  for (const { link } of [...metadata.embeds || [], ...metadata.links || []]) {
+    const path = resolve(link, note);
+    if (!path) continue;
+    if (isDrawing(path)) {
+      add(path);
+      const stem = path.replace(/\.md$/i, "");
+      for (const name of /* @__PURE__ */ new Set([stem, stem.replace(/\.excalidraw$/i, "")])) {
+        for (const ending of [".svg", ".dark.svg", ".light.svg", ".png"]) add(name + ending);
+      }
+    } else if (picture.test(path)) {
+      add(path);
+      const stem = path.replace(/(?:\.(?:dark|light))?\.[^.]+$/i, "");
+      for (const candidate of [stem + ".md", stem + ".excalidraw.md", stem + ".excalidraw"]) {
+        if (eligible.has(candidate) && isDrawing(candidate)) add(candidate);
+      }
+    }
+  }
+  return [...related].sort();
+}
+
+// src/history-modal.js
+var import_obsidian2 = require("obsidian");
+
+// src/history.js
+async function restoreCopy(vault, originalPath, commit, bytes) {
+  if (!validOid(commit) || !/\.md$/i.test(originalPath)) throw new Error("Invalid Markdown revision.");
+  const stem = originalPath.slice(0, -3) + " (history " + commit.slice(0, 12);
+  for (let n = 1; ; n++) {
+    const path = stem + (n > 1 ? "-" + n : "") + ").md";
+    if (await vault.adapter.exists(path)) continue;
+    try {
+      return await vault.createBinary(path, bytes);
+    } catch (error) {
+      if (!await vault.adapter.exists(path)) throw error;
+    }
+  }
+}
 
 // src/history-modal.js
 var NoteHistory = class extends import_obsidian2.Modal {
@@ -1910,8 +1982,8 @@ var Settings = class extends import_obsidian3.PluginSettingTab {
     const native = plugin.usesDesktopGit();
     if (!import_obsidian3.Platform.isMobile) {
       new import_obsidian3.Setting(el).setName(t("Use the Git plugin on this computer", "\u5728\u672C\u673A\u4F7F\u7528 Git \u63D2\u4EF6\u540C\u6B65")).setDesc(t(
-        "For vaults cloned with Git. Sync opens Source Control. Receive runs Git Pull on the checkout's current branch and upstream. The Git plugin manages background pulls.",
-        "\u9002\u7528\u4E8E\u7528 Git \u514B\u9686\u7684\u7B14\u8BB0\u5E93\u3002\u70B9\u540C\u6B65\u6253\u5F00\u53F3\u4FA7\u66F4\u6539\u9762\u677F\uFF0C\u70B9\u62C9\u53D6\u4F7F\u7528\u672C\u5730\u5206\u652F\u53CA\u5176\u4E0A\u6E38\u3002\u81EA\u52A8\u62C9\u53D6\u5728 Git \u63D2\u4EF6\u4E2D\u8BBE\u7F6E\u3002"
+        "Open Git to review and stage changes. Sync commits the staging area and pushes to the current branch's upstream. Receive runs Git Pull.",
+        "\u70B9 Git \u67E5\u770B\u5DEE\u5F02\u3001\u6682\u5B58\u6587\u4EF6\u6216\u6BB5\u843D\u3002\u70B9 Sync \u63D0\u4EA4\u6682\u5B58\u533A\u5E76\u63A8\u9001\u5230\u5F53\u524D\u5206\u652F\u7684\u4E0A\u6E38\u3002\u70B9\u62C9\u53D6\u53EF\u63A5\u6536\u8FDC\u7AEF\u66F4\u65B0\u3002"
       )).addToggle((toggle) => toggle.setValue(native).onChange(async (value) => {
         try {
           if (plugin.busy) throw new Error(t("Wait for the current sync to finish.", "\u8BF7\u7B49\u5F53\u524D\u540C\u6B65\u5B8C\u6210\u3002"));
@@ -1933,10 +2005,7 @@ var Settings = class extends import_obsidian3.PluginSettingTab {
     }));
     this.statusSetting = new import_obsidian3.Setting(el).setName(t("Sync status on this device", "\u672C\u8BBE\u5907\u540C\u6B65\u72B6\u6001"));
     plugin.refreshStatus();
-    new import_obsidian3.Setting(el).setName(t("Sync vault", "\u540C\u6B65\u7B14\u8BB0")).setDesc(native ? t("Select changed files in Source Control, commit staged files, then push.", "\u5728\u53F3\u4FA7\u9762\u677F\u67E5\u770B\u5DEE\u5F02\uFF0C\u6682\u5B58\u9009\u4E2D\u7684\u6587\u4EF6\uFF0C\u63D0\u4EA4\u5DF2\u6682\u5B58\u7684\u6539\u52A8\uFF0C\u518D\u63A8\u9001\u3002") : t("Review incoming changes and choose the local files to commit together.", "\u9884\u89C8\u5F85\u63A5\u6536\u7684\u6539\u52A8\uFF0C\u5E76\u52FE\u9009\u672C\u6B21\u4E00\u8D77\u63D0\u4EA4\u7684\u6587\u4EF6\u3002")).addButton((b) => b.setButtonText(native ? t("Open Git changes", "\u6253\u5F00 Git \u66F4\u6539") : t("Review changes", "\u9884\u89C8\u540C\u6B65\u6539\u52A8")).onClick(() => {
-      if (native) this.app.setting?.close();
-      return plugin.run(true);
-    })).addButton((b) => b.setButtonText(native ? t("Git pull", "\u7528 Git \u62C9\u53D6") : t("Receive changes", "\u4EC5\u63A5\u6536")).onClick(() => plugin.run(false)));
+    new import_obsidian3.Setting(el).setName(t("Sync vault", "\u540C\u6B65\u7B14\u8BB0")).setDesc(native ? t("Stage files or hunks in Git first. A failed push keeps the commit for a retry.", "\u5148\u5728 Git \u9762\u677F\u6682\u5B58\u6587\u4EF6\u6216\u6BB5\u843D\u3002\u63A8\u9001\u5931\u8D25\u65F6\uFF0C\u63D0\u4EA4\u4F1A\u4FDD\u7559\u5728\u672C\u673A\u4F9B\u91CD\u8BD5\u3002") : t("Review incoming changes and choose the local files to commit together.", "\u9884\u89C8\u5F85\u63A5\u6536\u7684\u6539\u52A8\uFF0C\u5E76\u52FE\u9009\u672C\u6B21\u4E00\u8D77\u63D0\u4EA4\u7684\u6587\u4EF6\u3002")).addButton((b) => b.setButtonText(native ? t("Commit staged and push", "\u63D0\u4EA4\u5DF2\u6682\u5B58\u7684\u6539\u52A8\u5E76\u63A8\u9001") : t("Review changes", "\u9884\u89C8\u540C\u6B65\u6539\u52A8")).onClick(() => plugin.run(true))).addButton((b) => b.setButtonText(native ? t("Git pull", "\u7528 Git \u62C9\u53D6") : t("Receive changes", "\u4EC5\u63A5\u6536")).onClick(() => plugin.run(false)));
   }
   hide() {
     this.statusSetting = null;
@@ -1950,8 +2019,8 @@ var VaultBranchSync = class extends import_obsidian3.Plugin {
     this.settingsTab = new Settings(this.app, this);
     this.addSettingTab(this.settingsTab);
     if (!import_obsidian3.Platform.isMobile) this.statusBar = this.addStatusBarItem();
+    this.ribbon = this.addRibbonIcon("refresh-cw", t("Sync vault with GitHub", "\u540C\u6B65\u7B14\u8BB0\u5230 GitHub"), () => this.run(true));
     this.refreshStatus();
-    this.addRibbonIcon("refresh-cw", t("Sync vault with GitHub", "\u540C\u6B65\u7B14\u8BB0\u5230 GitHub"), () => this.run(true));
     this.addCommand({ id: "sync", name: t("Sync with GitHub", "\u4E0E GitHub \u540C\u6B65"), callback: () => this.run(true) });
     this.addCommand({ id: "receive", name: t("Receive changes from GitHub", "\u4EC5\u63A5\u6536 GitHub \u66F4\u65B0"), callback: () => this.run(false) });
     if (!import_obsidian3.Platform.isMobile) this.addCommand({
@@ -1986,6 +2055,8 @@ var VaultBranchSync = class extends import_obsidian3.Plugin {
   }
   onunload() {
     this.active = false;
+    this.queuedGit?.();
+    this.queuedGit = null;
     this.win?.clearTimeout(this.autoTimer);
     this.reviewModal?.close();
     this.historyModal?.close();
@@ -2014,6 +2085,41 @@ var VaultBranchSync = class extends import_obsidian3.Plugin {
       new import_obsidian3.Notice(error.message, 9e3);
     }
   }
+  async pushStaged() {
+    try {
+      await this.requireDesktopGit();
+      const provider = this.app.plugins?.getPlugin?.("obsidian-git");
+      if (!provider?.promiseQueue?.addTask) {
+        throw new Error(t("Enable the Git community plugin to sync the staging area.", "\u8BF7\u542F\u7528 Git \u793E\u533A\u63D2\u4EF6\u4EE5\u540C\u6B65\u6682\u5B58\u533A\u3002"));
+      }
+      if (this.busy || !this.active) return;
+      this.queuedGit?.();
+      await new Promise((resolve, reject) => {
+        this.queuedGit = resolve;
+        provider.promiseQueue.addTask(async () => {
+          if (this.queuedGit !== resolve) return;
+          this.queuedGit = null;
+          if (!this.active || !this.usesDesktopGit() || this.busy) {
+            resolve();
+            return;
+          }
+          this.busy = true;
+          try {
+            const message = await syncStaged(this.app, provider);
+            if (this.active) new import_obsidian3.Notice(message, 7e3);
+            resolve();
+          } catch (error) {
+            reject(error);
+          } finally {
+            this.busy = false;
+            this.app.workspace.trigger("obsidian-git:refresh");
+          }
+        });
+      });
+    } catch (error) {
+      if (this.active) new import_obsidian3.Notice(error.message, 1e4);
+    }
+  }
   scheduleReceive() {
     if (!this.ready || !this.active) return;
     this.win.clearTimeout(this.autoTimer);
@@ -2024,8 +2130,8 @@ var VaultBranchSync = class extends import_obsidian3.Plugin {
   }
   statusText() {
     if (this.usesDesktopGit()) return t(
-      "Desktop Git \xB7 Open Source Control to see changes, commits and push status.",
-      "\u672C\u673A\u4F7F\u7528 Git \xB7 \u5728\u53F3\u4FA7\u66F4\u6539\u9762\u677F\u67E5\u770B\u6587\u4EF6\u3001\u63D0\u4EA4\u548C\u63A8\u9001\u72B6\u6001\u3002"
+      "Desktop Git \xB7 Stage in Git, then use Sync to commit and push.",
+      "\u672C\u673A\u4F7F\u7528 Git \xB7 \u5728 Git \u9762\u677F\u6682\u5B58\uFF0C\u70B9 Sync \u63D0\u4EA4\u5E76\u63A8\u9001\u3002"
     );
     const status = this.app.loadLocalStorage(statusKey);
     let text = t("No sync recorded on this device yet.", "\u672C\u8BBE\u5907\u5C1A\u65E0\u540C\u6B65\u8BB0\u5F55\u3002");
@@ -2041,6 +2147,7 @@ var VaultBranchSync = class extends import_obsidian3.Plugin {
   }
   refreshStatus() {
     const text = this.statusText();
+    if (this.ribbon) (0, import_obsidian3.setTooltip)(this.ribbon, this.usesDesktopGit() ? t("Sync: commit staged changes and push", "Sync \xB7 \u63D0\u4EA4\u5DF2\u6682\u5B58\u7684\u6539\u52A8\u5E76\u63A8\u9001") : t("Sync vault with GitHub", "\u540C\u6B65\u7B14\u8BB0\u5230 GitHub"), { placement: "right" });
     this.settingsTab?.statusSetting?.setDesc(text);
     if (this.statusBar) {
       if (this.usesDesktopGit()) {
@@ -2117,7 +2224,10 @@ var VaultBranchSync = class extends import_obsidian3.Plugin {
       return;
     }
     if (this.usesDesktopGit()) {
-      if (!automatic) await this.gitAction(send ? "open-git-view" : "pull");
+      if (!automatic) {
+        if (send) await this.pushStaged();
+        else await this.gitAction("pull");
+      }
       return;
     }
     const connection = this.connection();

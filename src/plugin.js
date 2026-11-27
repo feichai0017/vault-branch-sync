@@ -1,4 +1,5 @@
-import {Notice, Platform, Plugin, PluginSettingTab, Setting, TextFileView, TFolder, arrayBufferToBase64, getLanguage, parseLinktext, requestUrl} from "obsidian";
+import {Notice, Platform, Plugin, PluginSettingTab, Setting, TextFileView, TFolder, arrayBufferToBase64, getLanguage, parseLinktext, requestUrl, setTooltip} from "obsidian";
+import {syncStaged} from "./desktop-git.js";
 import {relatedFigures} from "./attachments.js";
 import {compareNote, isMarkdownNote} from "./compare.js";
 import {NoteHistory} from "./history-modal.js";
@@ -96,8 +97,8 @@ class Settings extends PluginSettingTab {
         const native = plugin.usesDesktopGit();
         if (!Platform.isMobile) {
             new Setting(el).setName(t("Use the Git plugin on this computer", "在本机使用 Git 插件同步"))
-                .setDesc(t("For vaults cloned with Git. Sync opens Source Control. Receive runs Git Pull on the checkout's current branch and upstream. The Git plugin manages background pulls.",
-                    "适用于用 Git 克隆的笔记库。点同步打开右侧更改面板，点拉取使用本地分支及其上游。自动拉取在 Git 插件中设置。"))
+                .setDesc(t("Open Git to review and stage changes. Sync commits the staging area and pushes to the current branch's upstream. Receive runs Git Pull.",
+                    "点 Git 查看差异、暂存文件或段落。点 Sync 提交暂存区并推送到当前分支的上游。点拉取可接收远端更新。"))
                 .addToggle(toggle => toggle.setValue(native).onChange(async value => {
                     try {
                         if (plugin.busy) throw new Error(t("Wait for the current sync to finish.", "请等当前同步完成。"));
@@ -118,10 +119,10 @@ class Settings extends PluginSettingTab {
         this.statusSetting = new Setting(el).setName(t("Sync status on this device", "本设备同步状态"));
         plugin.refreshStatus();
         new Setting(el).setName(t("Sync vault", "同步笔记"))
-            .setDesc(native ? t("Select changed files in Source Control, commit staged files, then push.", "在右侧面板查看差异，暂存选中的文件，提交已暂存的改动，再推送。")
+            .setDesc(native ? t("Stage files or hunks in Git first. A failed push keeps the commit for a retry.", "先在 Git 面板暂存文件或段落。推送失败时，提交会保留在本机供重试。")
                 : t("Review incoming changes and choose the local files to commit together.", "预览待接收的改动，并勾选本次一起提交的文件。"))
-            .addButton(b => b.setButtonText(native ? t("Open Git changes", "打开 Git 更改") : t("Review changes", "预览同步改动"))
-                .onClick(() => { if (native) this.app.setting?.close(); return plugin.run(true); }))
+            .addButton(b => b.setButtonText(native ? t("Commit staged and push", "提交已暂存的改动并推送") : t("Review changes", "预览同步改动"))
+                .onClick(() => plugin.run(true)))
             .addButton(b => b.setButtonText(native ? t("Git pull", "用 Git 拉取") : t("Receive changes", "仅接收")).onClick(() => plugin.run(false)));
     }
 
@@ -136,8 +137,8 @@ export default class VaultBranchSync extends Plugin {
         this.settingsTab = new Settings(this.app, this);
         this.addSettingTab(this.settingsTab);
         if (!Platform.isMobile) this.statusBar = this.addStatusBarItem();
+        this.ribbon = this.addRibbonIcon("refresh-cw", t("Sync vault with GitHub", "同步笔记到 GitHub"), () => this.run(true));
         this.refreshStatus();
-        this.addRibbonIcon("refresh-cw", t("Sync vault with GitHub", "同步笔记到 GitHub"), () => this.run(true));
         this.addCommand({id: "sync", name: t("Sync with GitHub", "与 GitHub 同步"), callback: () => this.run(true)});
         this.addCommand({id: "receive", name: t("Receive changes from GitHub", "仅接收 GitHub 更新"), callback: () => this.run(false)});
         if (!Platform.isMobile) this.addCommand({id: "git-diff", name: t("View Git diff for current file", "查看当前文件的 Git 差异"),
@@ -171,6 +172,8 @@ export default class VaultBranchSync extends Plugin {
 
     onunload() {
         this.active = false;
+        this.queuedGit?.();
+        this.queuedGit = null;
         this.win?.clearTimeout(this.autoTimer);
         this.reviewModal?.close();
         this.historyModal?.close();
@@ -198,6 +201,40 @@ export default class VaultBranchSync extends Plugin {
         } catch (error) { new Notice(error.message, 9000); }
     }
 
+    async pushStaged() {
+        try {
+            await this.requireDesktopGit();
+            const provider = this.app.plugins?.getPlugin?.("obsidian-git");
+            if (!provider?.promiseQueue?.addTask) {
+                throw new Error(t("Enable the Git community plugin to sync the staging area.", "请启用 Git 社区插件以同步暂存区。"));
+            }
+            if (this.busy || !this.active) return;
+            // Git can clear its queue during a reload. A new click supersedes an unstarted request.
+            this.queuedGit?.();
+            await new Promise((resolve, reject) => {
+                this.queuedGit = resolve;
+                provider.promiseQueue.addTask(async () => {
+                    if (this.queuedGit !== resolve) return;
+                    this.queuedGit = null;
+                    if (!this.active || !this.usesDesktopGit() || this.busy) { resolve(); return; }
+                    this.busy = true;
+                    try {
+                        const message = await syncStaged(this.app, provider);
+                        if (this.active) new Notice(message, 7000);
+                        resolve();
+                    }
+                    catch (error) { reject(error); }
+                    finally {
+                        this.busy = false;
+                        this.app.workspace.trigger("obsidian-git:refresh");
+                    }
+                });
+            });
+        } catch (error) {
+            if (this.active) new Notice(error.message, 10000);
+        }
+    }
+
     scheduleReceive() {
         if (!this.ready || !this.active) return;
         this.win.clearTimeout(this.autoTimer);
@@ -209,8 +246,8 @@ export default class VaultBranchSync extends Plugin {
     }
 
     statusText() {
-        if (this.usesDesktopGit()) return t("Desktop Git · Open Source Control to see changes, commits and push status.",
-            "本机使用 Git · 在右侧更改面板查看文件、提交和推送状态。");
+        if (this.usesDesktopGit()) return t("Desktop Git · Stage in Git, then use Sync to commit and push.",
+            "本机使用 Git · 在 Git 面板暂存，点 Sync 提交并推送。");
         const status = this.app.loadLocalStorage(statusKey);
         let text = t("No sync recorded on this device yet.", "本设备尚无同步记录。");
         if (status?.lastSuccess) text = t("Last successful sync", "上次成功同步") + " · " + new Date(status.lastSuccess).toLocaleString(getLanguage());
@@ -226,6 +263,8 @@ export default class VaultBranchSync extends Plugin {
 
     refreshStatus() {
         const text = this.statusText();
+        if (this.ribbon) setTooltip(this.ribbon, this.usesDesktopGit() ? t("Sync: commit staged changes and push", "Sync · 提交已暂存的改动并推送")
+            : t("Sync vault with GitHub", "同步笔记到 GitHub"), {placement: "right"});
         this.settingsTab?.statusSetting?.setDesc(text);
         if (this.statusBar) {
             if (this.usesDesktopGit()) {
@@ -298,7 +337,10 @@ export default class VaultBranchSync extends Plugin {
             return;
         }
         if (this.usesDesktopGit()) {
-            if (!automatic) await this.gitAction(send ? "open-git-view" : "pull");
+            if (!automatic) {
+                if (send) await this.pushStaged();
+                else await this.gitAction("pull");
+            }
             return;
         }
         const connection = this.connection();
