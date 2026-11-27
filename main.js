@@ -1610,8 +1610,11 @@ function checkedOid(value) {
   if (!validOid(value)) throw new Error("GitHub returned an invalid Git object identifier.");
   return value;
 }
+function errorDetail(message) {
+  return typeof message === "string" ? message.replace(/[\r\n\t]+/g, " ").slice(0, 360) : "";
+}
 var GitHubError = class extends Error {
-  constructor(status) {
+  constructor(status, detail) {
     const messages = {
       401: "GitHub rejected the token. Reconnect in the plugin settings.",
       403: "GitHub refused the request. Check the token's Contents permission, branch rules and API rate limit.",
@@ -1621,7 +1624,8 @@ var GitHubError = class extends Error {
       422: "GitHub rejected the proposed change. Check the branch rules and file size.",
       429: "GitHub is rate-limiting requests. Try again later."
     };
-    super(messages[status] || "GitHub request failed (HTTP " + status + ").");
+    const summary = messages[status] || "GitHub request failed (HTTP " + status + ").";
+    super(detail ? summary + " GitHub: " + detail : summary);
     this.status = status;
   }
 };
@@ -1648,7 +1652,14 @@ var GitHub = class {
       },
       ...body ? { body: JSON.stringify(body) } : {}
     });
-    if (response.status < 200 || response.status >= 300) throw new GitHubError(response.status);
+    if (response.status < 200 || response.status >= 300) {
+      let detail;
+      try {
+        detail = errorDetail(response.json?.message);
+      } catch {
+      }
+      throw new GitHubError(response.status, detail);
+    }
     return binary ? response.arrayBuffer : response.json;
   }
   async repository() {
@@ -1771,13 +1782,26 @@ var GitHub = class {
       parents: [snapshot.head]
     });
     const after = checkedOid(commit.sha);
-    const result = await this.call("/graphql", "POST", { query: moveRef, variables: { input: {
-      repositoryId: snapshot.node,
-      refUpdates: [{ name: "refs/heads/" + this.branch, beforeOid: snapshot.head, afterOid: after, force: false }]
-    } } });
-    if (!result.data?.updateRefs || result.errors?.length) {
-      if (await this.head() !== snapshot.head) throw new HeadMoved("Another device pushed first.");
-      throw new Error("GitHub could not update the branch. Check its rules and the token's Contents write permission.");
+    try {
+      const result = await this.call("/graphql", "POST", { query: moveRef, variables: { input: {
+        repositoryId: snapshot.node,
+        clientMutationId: after,
+        refUpdates: [{ name: "refs/heads/" + this.branch, beforeOid: snapshot.head, afterOid: after, force: false }]
+      } } });
+      if (!result?.data?.updateRefs || result.errors?.length) {
+        const reason = errorDetail(result?.errors?.[0]?.message);
+        throw new Error(reason ? "GitHub: " + reason : "GitHub did not confirm the branch update.");
+      }
+    } catch (error) {
+      let head;
+      try {
+        head = await this.head();
+      } catch {
+        throw error;
+      }
+      if (head === after) return after;
+      if (head !== snapshot.head) throw new HeadMoved("Another device pushed first.");
+      throw error;
     }
     return after;
   }
@@ -1788,6 +1812,7 @@ var connectionKey = "vault-branch-sync.connection.v1";
 var baselineKey = "vault-branch-sync.baseline.v1";
 var autoKey = "vault-branch-sync.auto-receive";
 var statusKey = "vault-branch-sync.last-sync";
+var desktopGitKey = "vault-branch-sync.desktop-git";
 var tokenPage = "https://github.com/settings/personal-access-tokens/new?name=Vault%20Branch%20Sync&contents=write";
 function vaultFiles(app, scope) {
   const vault = app.vault, disk = vault.adapter;
@@ -1849,10 +1874,10 @@ var Settings = class extends import_obsidian3.PluginSettingTab {
       branchInput = input;
       input.setPlaceholder(t("Default branch", "\u9ED8\u8BA4\u5206\u652F")).setValue(current?.branch || "");
     });
-    const desc = el.ownerDocument.createDocumentFragment();
-    desc.appendText(t("Choose only your vault repository and grant Contents read and write. ", "\u53EA\u9009\u62E9\u81EA\u5DF1\u7684\u7B14\u8BB0\u4ED3\u5E93\uFF0C\u6388\u4E88 Contents \u8BFB\u5199\u6743\u9650\u3002"));
-    desc.createEl("a", { text: t("Create a fine-grained token on GitHub", "\u5230 GitHub \u521B\u5EFA\u7EC6\u7C92\u5EA6\u4EE4\u724C"), href: tokenPage });
-    new import_obsidian3.Setting(el).setName(t("GitHub token", "GitHub \u4EE4\u724C")).setDesc(desc).addText((input) => {
+    const tokenSetting = new import_obsidian3.Setting(el).setName(t("GitHub token", "GitHub \u4EE4\u724C"));
+    tokenSetting.descEl.appendText(t("Choose only your vault repository and grant Contents read and write. ", "\u53EA\u9009\u62E9\u81EA\u5DF1\u7684\u7B14\u8BB0\u4ED3\u5E93\uFF0C\u6388\u4E88 Contents \u8BFB\u5199\u6743\u9650\u3002"));
+    tokenSetting.descEl.createEl("a", { text: t("Create a fine-grained token on GitHub", "\u5230 GitHub \u521B\u5EFA\u7EC6\u7C92\u5EA6\u4EE4\u724C"), href: tokenPage });
+    tokenSetting.addText((input) => {
       tokenInput = input;
       input.inputEl.type = "password";
       input.inputEl.autocomplete = "off";
@@ -1882,7 +1907,24 @@ var Settings = class extends import_obsidian3.PluginSettingTab {
         button.setDisabled(false);
       }
     }));
-    new import_obsidian3.Setting(el).setName(t("Receive when opening or returning to this vault", "\u6253\u5F00\u7B14\u8BB0\u5E93\u6216\u56DE\u5230\u524D\u53F0\u65F6\u81EA\u52A8\u63A5\u6536")).setDesc(t(
+    const native = plugin.usesDesktopGit();
+    if (!import_obsidian3.Platform.isMobile) {
+      new import_obsidian3.Setting(el).setName(t("Use the Git plugin on this computer", "\u5728\u672C\u673A\u4F7F\u7528 Git \u63D2\u4EF6\u540C\u6B65")).setDesc(t(
+        "For vaults cloned with Git. Sync opens Source Control. Receive runs Git Pull on the checkout's current branch and upstream. The Git plugin manages background pulls.",
+        "\u9002\u7528\u4E8E\u7528 Git \u514B\u9686\u7684\u7B14\u8BB0\u5E93\u3002\u70B9\u540C\u6B65\u6253\u5F00\u53F3\u4FA7\u66F4\u6539\u9762\u677F\uFF0C\u70B9\u62C9\u53D6\u4F7F\u7528\u672C\u5730\u5206\u652F\u53CA\u5176\u4E0A\u6E38\u3002\u81EA\u52A8\u62C9\u53D6\u5728 Git \u63D2\u4EF6\u4E2D\u8BBE\u7F6E\u3002"
+      )).addToggle((toggle) => toggle.setValue(native).onChange(async (value) => {
+        try {
+          if (plugin.busy) throw new Error(t("Wait for the current sync to finish.", "\u8BF7\u7B49\u5F53\u524D\u540C\u6B65\u5B8C\u6210\u3002"));
+          if (value) await plugin.requireDesktopGit();
+          this.app.saveLocalStorage(desktopGitKey, value);
+          plugin.scheduleReceive();
+        } catch (error) {
+          new import_obsidian3.Notice(error.message, 9e3);
+        }
+        this.display();
+      }));
+    }
+    if (!native) new import_obsidian3.Setting(el).setName(t("Receive when opening or returning to this vault", "\u6253\u5F00\u7B14\u8BB0\u5E93\u6216\u56DE\u5230\u524D\u53F0\u65F6\u81EA\u52A8\u63A5\u6536")).setDesc(t(
       "On this device, download GitHub changes and leave conflicts for review. Uploads are always manual.",
       "\u6B64\u8BBE\u5907\u4F1A\u81EA\u52A8\u63A5\u6536 GitHub \u66F4\u65B0\uFF0C\u9047\u5230\u51B2\u7A81\u7559\u5F85\u4F60\u9009\u62E9\u3002\u4E0A\u4F20\u4ECD\u7531\u4F60\u624B\u52A8\u53D1\u8D77\u3002"
     )).addToggle((toggle) => toggle.setValue(plugin.autoEnabled()).onChange((value) => {
@@ -1891,7 +1933,10 @@ var Settings = class extends import_obsidian3.PluginSettingTab {
     }));
     this.statusSetting = new import_obsidian3.Setting(el).setName(t("Sync status on this device", "\u672C\u8BBE\u5907\u540C\u6B65\u72B6\u6001"));
     plugin.refreshStatus();
-    new import_obsidian3.Setting(el).setName(t("Sync vault", "\u540C\u6B65\u7B14\u8BB0")).setDesc(t("Review incoming changes and choose the local files to commit together.", "\u9884\u89C8\u5F85\u63A5\u6536\u7684\u6539\u52A8\uFF0C\u5E76\u52FE\u9009\u672C\u6B21\u4E00\u8D77\u63D0\u4EA4\u7684\u6587\u4EF6\u3002")).addButton((b) => b.setButtonText(t("Review changes", "\u9884\u89C8\u540C\u6B65\u6539\u52A8")).onClick(() => plugin.run(true))).addButton((b) => b.setButtonText(t("Receive changes", "\u4EC5\u63A5\u6536")).onClick(() => plugin.run(false)));
+    new import_obsidian3.Setting(el).setName(t("Sync vault", "\u540C\u6B65\u7B14\u8BB0")).setDesc(native ? t("Select changed files in Source Control, commit staged files, then push.", "\u5728\u53F3\u4FA7\u9762\u677F\u67E5\u770B\u5DEE\u5F02\uFF0C\u6682\u5B58\u9009\u4E2D\u7684\u6587\u4EF6\uFF0C\u63D0\u4EA4\u5DF2\u6682\u5B58\u7684\u6539\u52A8\uFF0C\u518D\u63A8\u9001\u3002") : t("Review incoming changes and choose the local files to commit together.", "\u9884\u89C8\u5F85\u63A5\u6536\u7684\u6539\u52A8\uFF0C\u5E76\u52FE\u9009\u672C\u6B21\u4E00\u8D77\u63D0\u4EA4\u7684\u6587\u4EF6\u3002")).addButton((b) => b.setButtonText(native ? t("Open Git changes", "\u6253\u5F00 Git \u66F4\u6539") : t("Review changes", "\u9884\u89C8\u540C\u6B65\u6539\u52A8")).onClick(() => {
+      if (native) this.app.setting?.close();
+      return plugin.run(true);
+    })).addButton((b) => b.setButtonText(native ? t("Git pull", "\u7528 Git \u62C9\u53D6") : t("Receive changes", "\u4EC5\u63A5\u6536")).onClick(() => plugin.run(false)));
   }
   hide() {
     this.statusSetting = null;
@@ -1909,6 +1954,15 @@ var VaultBranchSync = class extends import_obsidian3.Plugin {
     this.addRibbonIcon("refresh-cw", t("Sync vault with GitHub", "\u540C\u6B65\u7B14\u8BB0\u5230 GitHub"), () => this.run(true));
     this.addCommand({ id: "sync", name: t("Sync with GitHub", "\u4E0E GitHub \u540C\u6B65"), callback: () => this.run(true) });
     this.addCommand({ id: "receive", name: t("Receive changes from GitHub", "\u4EC5\u63A5\u6536 GitHub \u66F4\u65B0"), callback: () => this.run(false) });
+    if (!import_obsidian3.Platform.isMobile) this.addCommand({
+      id: "git-diff",
+      name: t("View Git diff for current file", "\u67E5\u770B\u5F53\u524D\u6587\u4EF6\u7684 Git \u5DEE\u5F02"),
+      checkCallback: (checking) => {
+        if (!this.usesDesktopGit() || !this.app.workspace.getActiveFile()) return false;
+        if (!checking) void this.gitAction("open-diff-view");
+        return true;
+      }
+    });
     this.addCommand({ id: "show-status", name: t("Show sync status", "\u67E5\u770B\u540C\u6B65\u72B6\u6001"), callback: () => new import_obsidian3.Notice(this.statusText(), 8e3) });
     const historyTitle = t("View note history on GitHub", "\u67E5\u770B\u672C\u7BC7 GitHub \u5386\u53F2");
     this.addCommand({ id: "note-history", name: historyTitle, checkCallback: (checking) => {
@@ -1939,17 +1993,44 @@ var VaultBranchSync = class extends import_obsidian3.Plugin {
   autoEnabled() {
     return this.app.loadLocalStorage(autoKey) === true;
   }
+  usesDesktopGit() {
+    return !import_obsidian3.Platform.isMobile && this.app.loadLocalStorage(desktopGitKey) === true;
+  }
+  async requireDesktopGit() {
+    if (!this.app.commands?.listCommands?.().some((command) => command.id === "obsidian-git:open-git-view")) {
+      throw new Error(t("Enable the Git community plugin in this vault.", "\u8BF7\u5148\u5728\u672C\u5E93\u7684\u7B2C\u4E09\u65B9\u63D2\u4EF6\u4E2D\u542F\u7528 Git\u3002"));
+    }
+    if (!await this.app.vault.adapter.exists(".git")) {
+      throw new Error(t("Open a vault whose root is a Git checkout.", "\u8BF7\u6253\u5F00\u6839\u76EE\u5F55\u542B\u6709 .git \u7684\u7B14\u8BB0\u5E93\u3002"));
+    }
+  }
+  async gitAction(command) {
+    try {
+      await this.requireDesktopGit();
+      if (!this.app.commands.executeCommandById("obsidian-git:" + command)) {
+        throw new Error(t("This Git command is unavailable in the current view.", "\u5F53\u524D\u89C6\u56FE\u65E0\u6CD5\u6267\u884C\u8FD9\u4E2A Git \u547D\u4EE4\u3002"));
+      }
+    } catch (error) {
+      new import_obsidian3.Notice(error.message, 9e3);
+    }
+  }
   scheduleReceive() {
     if (!this.ready || !this.active) return;
     this.win.clearTimeout(this.autoTimer);
-    if (this.doc.hidden || this.busy || !this.autoEnabled() || !this.connection()) return;
+    if (this.usesDesktopGit() || this.doc.hidden || this.busy || !this.autoEnabled() || !this.connection()) return;
     this.autoTimer = this.win.setTimeout(() => {
       if (this.active && !this.doc.hidden && !this.busy && this.autoEnabled()) void this.run(false, true);
     }, 300);
   }
   statusText() {
+    if (this.usesDesktopGit()) return t(
+      "Desktop Git \xB7 Open Source Control to see changes, commits and push status.",
+      "\u672C\u673A\u4F7F\u7528 Git \xB7 \u5728\u53F3\u4FA7\u66F4\u6539\u9762\u677F\u67E5\u770B\u6587\u4EF6\u3001\u63D0\u4EA4\u548C\u63A8\u9001\u72B6\u6001\u3002"
+    );
     const status = this.app.loadLocalStorage(statusKey);
-    let text = status?.lastSuccess ? t("Last successful sync", "\u4E0A\u6B21\u6210\u529F\u540C\u6B65") + " \xB7 " + new Date(status.lastSuccess).toLocaleString((0, import_obsidian3.getLanguage)()) : t("No successful sync on this device yet.", "\u672C\u8BBE\u5907\u8FD8\u6CA1\u6709\u6210\u529F\u540C\u6B65\u8BB0\u5F55\u3002");
+    let text = t("No sync recorded on this device yet.", "\u672C\u8BBE\u5907\u5C1A\u65E0\u540C\u6B65\u8BB0\u5F55\u3002");
+    if (status?.lastSuccess) text = t("Last successful sync", "\u4E0A\u6B21\u6210\u529F\u540C\u6B65") + " \xB7 " + new Date(status.lastSuccess).toLocaleString((0, import_obsidian3.getLanguage)());
+    else if (status) text = t("Last check reached GitHub", "\u4E0A\u6B21\u68C0\u67E5\u5DF2\u8FDE\u901A GitHub");
     if (status) {
       text += t(" | Last check: received ", " | \u4E0A\u6B21\u68C0\u67E5\u63A5\u6536 ") + status.received + t(", committed ", "\uFF0C\u63D0\u4EA4 ") + status.sent;
       if (status.deferred) text += t(", conflicts to review ", "\uFF0C\u5F85\u5904\u7406\u51B2\u7A81 ") + status.deferred;
@@ -1962,8 +2043,15 @@ var VaultBranchSync = class extends import_obsidian3.Plugin {
     const text = this.statusText();
     this.settingsTab?.statusSetting?.setDesc(text);
     if (this.statusBar) {
+      if (this.usesDesktopGit()) {
+        this.statusBar.setText("Git");
+        this.statusBar.setAttribute("aria-label", text);
+        this.statusBar.title = text;
+        return;
+      }
       const status = this.app.loadLocalStorage(statusKey);
-      const time = status?.lastSuccess ? new Date(status.lastSuccess).toLocaleTimeString((0, import_obsidian3.getLanguage)(), { hour: "2-digit", minute: "2-digit" }) : "\u2014";
+      const stamp = status?.lastChecked || status?.lastSuccess;
+      const time = stamp ? new Date(stamp).toLocaleTimeString((0, import_obsidian3.getLanguage)(), { hour: "2-digit", minute: "2-digit" }) : "\u2014";
       this.statusBar.setText(this.connection() ? "GitHub \xB7 " + time + (status?.deferred || this.lastError ? " \u26A0" : "") : "");
       this.statusBar.setAttribute("aria-label", text);
       this.statusBar.title = text;
@@ -2026,6 +2114,10 @@ var VaultBranchSync = class extends import_obsidian3.Plugin {
   async run(send, automatic = false) {
     if (this.busy || !this.active) {
       if (!automatic && this.active) new import_obsidian3.Notice(t("A sync or connection check is already running.", "\u6B63\u5728\u540C\u6B65\u6216\u68C0\u67E5\u8FDE\u63A5\u3002"));
+      return;
+    }
+    if (this.usesDesktopGit()) {
+      if (!automatic) await this.gitAction(send ? "open-git-view" : "pull");
       return;
     }
     const connection = this.connection();
@@ -2094,8 +2186,10 @@ var VaultBranchSync = class extends import_obsidian3.Plugin {
           }
           const previous = this.app.loadLocalStorage(statusKey);
           const { received, sent, deferred } = result;
+          const lastChecked = Date.now();
           this.app.saveLocalStorage(statusKey, {
-            lastSuccess: deferred ? previous?.lastSuccess ?? null : Date.now(),
+            lastChecked,
+            lastSuccess: received || sent || !deferred ? lastChecked : previous?.lastSuccess ?? null,
             received,
             sent,
             deferred,

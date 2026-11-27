@@ -11,6 +11,7 @@ const connectionKey = "vault-branch-sync.connection.v1";
 const baselineKey = "vault-branch-sync.baseline.v1";
 const autoKey = "vault-branch-sync.auto-receive";
 const statusKey = "vault-branch-sync.last-sync";
+const desktopGitKey = "vault-branch-sync.desktop-git";
 const tokenPage = "https://github.com/settings/personal-access-tokens/new?name=Vault%20Branch%20Sync&contents=write";
 
 function vaultFiles(app, scope) {
@@ -67,11 +68,10 @@ class Settings extends PluginSettingTab {
         new Setting(el).setName(t("Branch", "分支"))
             .setDesc(t("Leave blank to use the repository's default branch.", "留空时使用仓库默认分支。"))
             .addText(input => {branchInput = input; input.setPlaceholder(t("Default branch", "默认分支")).setValue(current?.branch || "");});
-        const desc = el.ownerDocument.createDocumentFragment();
-        desc.appendText(t("Choose only your vault repository and grant Contents read and write. ", "只选择自己的笔记仓库，授予 Contents 读写权限。"));
-        desc.createEl("a", {text: t("Create a fine-grained token on GitHub", "到 GitHub 创建细粒度令牌"), href: tokenPage});
-        new Setting(el).setName(t("GitHub token", "GitHub 令牌")).setDesc(desc)
-            .addText(input => {
+        const tokenSetting = new Setting(el).setName(t("GitHub token", "GitHub 令牌"));
+        tokenSetting.descEl.appendText(t("Choose only your vault repository and grant Contents read and write. ", "只选择自己的笔记仓库，授予 Contents 读写权限。"));
+        tokenSetting.descEl.createEl("a", {text: t("Create a fine-grained token on GitHub", "到 GitHub 创建细粒度令牌"), href: tokenPage});
+        tokenSetting.addText(input => {
                 tokenInput = input;
                 input.inputEl.type = "password"; input.inputEl.autocomplete = "off"; input.inputEl.spellcheck = false;
                 input.setPlaceholder(current ? t("Saved on this device", "本设备已保存") : t("Paste token", "粘贴令牌"));
@@ -93,7 +93,22 @@ class Settings extends PluginSettingTab {
                 } catch (error) { new Notice(error.message, 10000); }
                 finally {button.setDisabled(false);}
             }));
-        new Setting(el).setName(t("Receive when opening or returning to this vault", "打开笔记库或回到前台时自动接收"))
+        const native = plugin.usesDesktopGit();
+        if (!Platform.isMobile) {
+            new Setting(el).setName(t("Use the Git plugin on this computer", "在本机使用 Git 插件同步"))
+                .setDesc(t("For vaults cloned with Git. Sync opens Source Control. Receive runs Git Pull on the checkout's current branch and upstream. The Git plugin manages background pulls.",
+                    "适用于用 Git 克隆的笔记库。点同步打开右侧更改面板，点拉取使用本地分支及其上游。自动拉取在 Git 插件中设置。"))
+                .addToggle(toggle => toggle.setValue(native).onChange(async value => {
+                    try {
+                        if (plugin.busy) throw new Error(t("Wait for the current sync to finish.", "请等当前同步完成。"));
+                        if (value) await plugin.requireDesktopGit();
+                        this.app.saveLocalStorage(desktopGitKey, value);
+                        plugin.scheduleReceive();
+                    } catch (error) { new Notice(error.message, 9000); }
+                    this.display();
+                }));
+        }
+        if (!native) new Setting(el).setName(t("Receive when opening or returning to this vault", "打开笔记库或回到前台时自动接收"))
             .setDesc(t("On this device, download GitHub changes and leave conflicts for review. Uploads are always manual.",
                 "此设备会自动接收 GitHub 更新，遇到冲突留待你选择。上传仍由你手动发起。"))
             .addToggle(toggle => toggle.setValue(plugin.autoEnabled()).onChange(value => {
@@ -103,9 +118,11 @@ class Settings extends PluginSettingTab {
         this.statusSetting = new Setting(el).setName(t("Sync status on this device", "本设备同步状态"));
         plugin.refreshStatus();
         new Setting(el).setName(t("Sync vault", "同步笔记"))
-            .setDesc(t("Review incoming changes and choose the local files to commit together.", "预览待接收的改动，并勾选本次一起提交的文件。"))
-            .addButton(b => b.setButtonText(t("Review changes", "预览同步改动")).onClick(() => plugin.run(true)))
-            .addButton(b => b.setButtonText(t("Receive changes", "仅接收")).onClick(() => plugin.run(false)));
+            .setDesc(native ? t("Select changed files in Source Control, commit staged files, then push.", "在右侧面板查看差异，暂存选中的文件，提交已暂存的改动，再推送。")
+                : t("Review incoming changes and choose the local files to commit together.", "预览待接收的改动，并勾选本次一起提交的文件。"))
+            .addButton(b => b.setButtonText(native ? t("Open Git changes", "打开 Git 更改") : t("Review changes", "预览同步改动"))
+                .onClick(() => { if (native) this.app.setting?.close(); return plugin.run(true); }))
+            .addButton(b => b.setButtonText(native ? t("Git pull", "用 Git 拉取") : t("Receive changes", "仅接收")).onClick(() => plugin.run(false)));
     }
 
     hide() { this.statusSetting = null; }
@@ -123,6 +140,12 @@ export default class VaultBranchSync extends Plugin {
         this.addRibbonIcon("refresh-cw", t("Sync vault with GitHub", "同步笔记到 GitHub"), () => this.run(true));
         this.addCommand({id: "sync", name: t("Sync with GitHub", "与 GitHub 同步"), callback: () => this.run(true)});
         this.addCommand({id: "receive", name: t("Receive changes from GitHub", "仅接收 GitHub 更新"), callback: () => this.run(false)});
+        if (!Platform.isMobile) this.addCommand({id: "git-diff", name: t("View Git diff for current file", "查看当前文件的 Git 差异"),
+            checkCallback: checking => {
+                if (!this.usesDesktopGit() || !this.app.workspace.getActiveFile()) return false;
+                if (!checking) void this.gitAction("open-diff-view");
+                return true;
+            }});
         this.addCommand({id: "show-status", name: t("Show sync status", "查看同步状态"), callback: () => new Notice(this.statusText(), 8000)});
         const historyTitle = t("View note history on GitHub", "查看本篇 GitHub 历史");
         this.addCommand({id: "note-history", name: historyTitle, checkCallback: checking => {
@@ -155,10 +178,30 @@ export default class VaultBranchSync extends Plugin {
 
     autoEnabled() { return this.app.loadLocalStorage(autoKey) === true; }
 
+    usesDesktopGit() { return !Platform.isMobile && this.app.loadLocalStorage(desktopGitKey) === true; }
+
+    async requireDesktopGit() {
+        if (!this.app.commands?.listCommands?.().some(command => command.id === "obsidian-git:open-git-view")) {
+            throw new Error(t("Enable the Git community plugin in this vault.", "请先在本库的第三方插件中启用 Git。"));
+        }
+        if (!await this.app.vault.adapter.exists(".git")) {
+            throw new Error(t("Open a vault whose root is a Git checkout.", "请打开根目录含有 .git 的笔记库。"));
+        }
+    }
+
+    async gitAction(command) {
+        try {
+            await this.requireDesktopGit();
+            if (!this.app.commands.executeCommandById("obsidian-git:" + command)) {
+                throw new Error(t("This Git command is unavailable in the current view.", "当前视图无法执行这个 Git 命令。"));
+            }
+        } catch (error) { new Notice(error.message, 9000); }
+    }
+
     scheduleReceive() {
         if (!this.ready || !this.active) return;
         this.win.clearTimeout(this.autoTimer);
-        if (this.doc.hidden || this.busy || !this.autoEnabled() || !this.connection()) return;
+        if (this.usesDesktopGit() || this.doc.hidden || this.busy || !this.autoEnabled() || !this.connection()) return;
         // iOS can signal both visibility and focus for the same foreground transition.
         this.autoTimer = this.win.setTimeout(() => {
             if (this.active && !this.doc.hidden && !this.busy && this.autoEnabled()) void this.run(false, true);
@@ -166,10 +209,12 @@ export default class VaultBranchSync extends Plugin {
     }
 
     statusText() {
+        if (this.usesDesktopGit()) return t("Desktop Git · Open Source Control to see changes, commits and push status.",
+            "本机使用 Git · 在右侧更改面板查看文件、提交和推送状态。");
         const status = this.app.loadLocalStorage(statusKey);
-        let text = status?.lastSuccess
-            ? t("Last successful sync", "上次成功同步") + " · " + new Date(status.lastSuccess).toLocaleString(getLanguage())
-            : t("No successful sync on this device yet.", "本设备还没有成功同步记录。");
+        let text = t("No sync recorded on this device yet.", "本设备尚无同步记录。");
+        if (status?.lastSuccess) text = t("Last successful sync", "上次成功同步") + " · " + new Date(status.lastSuccess).toLocaleString(getLanguage());
+        else if (status) text = t("Last check reached GitHub", "上次检查已连通 GitHub");
         if (status) {
             text += t(" | Last check: received ", " | 上次检查接收 ") + status.received + t(", committed ", "，提交 ") + status.sent;
             if (status.deferred) text += t(", conflicts to review ", "，待处理冲突 ") + status.deferred;
@@ -183,8 +228,15 @@ export default class VaultBranchSync extends Plugin {
         const text = this.statusText();
         this.settingsTab?.statusSetting?.setDesc(text);
         if (this.statusBar) {
+            if (this.usesDesktopGit()) {
+                this.statusBar.setText("Git");
+                this.statusBar.setAttribute("aria-label", text);
+                this.statusBar.title = text;
+                return;
+            }
             const status = this.app.loadLocalStorage(statusKey);
-            const time = status?.lastSuccess ? new Date(status.lastSuccess).toLocaleTimeString(getLanguage(), {hour: "2-digit", minute: "2-digit"}) : "—";
+            const stamp = status?.lastChecked || status?.lastSuccess;
+            const time = stamp ? new Date(stamp).toLocaleTimeString(getLanguage(), {hour: "2-digit", minute: "2-digit"}) : "—";
             this.statusBar.setText(this.connection() ? "GitHub · " + time + (status?.deferred || this.lastError ? " ⚠" : "") : "");
             this.statusBar.setAttribute("aria-label", text);
             this.statusBar.title = text;
@@ -245,6 +297,10 @@ export default class VaultBranchSync extends Plugin {
             if (!automatic && this.active) new Notice(t("A sync or connection check is already running.", "正在同步或检查连接。"));
             return;
         }
+        if (this.usesDesktopGit()) {
+            if (!automatic) await this.gitAction(send ? "open-git-view" : "pull");
+            return;
+        }
         const connection = this.connection();
         if (!connection) {
             if (!automatic) new Notice(t("Open Settings → Vault Branch Sync to connect a private GitHub repository.",
@@ -292,8 +348,10 @@ export default class VaultBranchSync extends Plugin {
                     }
                     const previous = this.app.loadLocalStorage(statusKey);
                     const {received, sent, deferred} = result;
+                    const lastChecked = Date.now();
                     this.app.saveLocalStorage(statusKey, {
-                        lastSuccess: deferred ? previous?.lastSuccess ?? null : Date.now(), received, sent, deferred, merged: result.merged || 0
+                        lastChecked, lastSuccess: received || sent || !deferred ? lastChecked : previous?.lastSuccess ?? null,
+                        received, sent, deferred, merged: result.merged || 0
                     });
                     this.lastError = null;
                     this.refreshStatus();

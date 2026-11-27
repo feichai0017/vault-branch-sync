@@ -29,11 +29,17 @@ Choose a resolution separately for each conflict. **Compare paragraphs** shows t
 
 With a Markdown note open, run **View note history on GitHub** from the command palette or its file menu. Select **Preview** beside a commit and **Restore as a copy**. The copy is placed beside your note and includes the short commit ID in its name. Existing copies keep their contents. The history lists commits for the note's current path on the connected branch, 20 at a time. Copies remain local until you select them for a commit.
 
+## Use the Git plugin on a desktop checkout
+
+If the vault root is a Git checkout, enable the **Git** community plugin and turn on **Use the Git plugin on this computer** in Vault Branch Sync. The sync icon now opens Git's Source Control panel. Select a filename to see its diff. Stage individual files with **+**, run **Git: Commit staged**, then **Git: Push**. To see changes alongside an open note, run **Vault Branch Sync: View Git diff for current file**, or enable Git's editor gutter for inline change markers. [Git plugin](https://github.com/Vinzent03/obsidian-git)
+
+**Receive changes** uses Git Pull for the checkout's active branch and configured upstream. Git controls automatic pulls on this computer. The separate GitHub connection is still used for note history. On a phone, the regular download and selective upload preview continue to use the private GitHub branch.
+
 ## What travels
 
 - Visible vault files, including Markdown, canvases, bases and binary attachments, are eligible for sync. A root or nested `.gitignore` can exclude new local files. Previously tracked files continue to sync.
 - **Include settings and themes** also transfers portable settings such as appearance and hotkeys, theme files and CSS snippets. Use the same configuration folder name across devices to share those files. Reopen the vault to apply downloaded appearance changes.
-- Git metadata, hidden directories, community plugin programs, plugin enable lists, plugin credentials and device workspace layouts stay local. Use one sync tool for a given folder. In a local Git checkout, this plugin changes the vault files while your Git client manages its own index and branches.
+- Direct GitHub sync skips Git metadata, hidden directories, community plugin programs, plugin enable lists, plugin credentials and device workspace layouts. In desktop Git mode your checkout's tracked files, ignore rules and staging area determine what you commit.
 - GitHub limits individual Git blobs to 100 MiB. This plugin uses ordinary Git blobs for attachments. Keep Git LFS material in a Git LFS workflow.
 
 ## Network and privacy

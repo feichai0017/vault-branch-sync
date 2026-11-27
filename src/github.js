@@ -10,8 +10,12 @@ function checkedOid(value) {
     return value;
 }
 
+function errorDetail(message) {
+    return typeof message === "string" ? message.replace(/[\r\n\t]+/g, " ").slice(0, 360) : "";
+}
+
 class GitHubError extends Error {
-    constructor(status) {
+    constructor(status, detail) {
         const messages = {
             401: "GitHub rejected the token. Reconnect in the plugin settings.",
             403: "GitHub refused the request. Check the token's Contents permission, branch rules and API rate limit.",
@@ -21,7 +25,8 @@ class GitHubError extends Error {
             422: "GitHub rejected the proposed change. Check the branch rules and file size.",
             429: "GitHub is rate-limiting requests. Try again later."
         };
-        super(messages[status] || "GitHub request failed (HTTP " + status + ").");
+        const summary = messages[status] || "GitHub request failed (HTTP " + status + ").";
+        super(detail ? summary + " GitHub: " + detail : summary);
         this.status = status;
     }
 }
@@ -46,7 +51,11 @@ export class GitHub {
                 ...(body ? {"Content-Type": "application/json"} : {})},
             ...(body ? {body: JSON.stringify(body)} : {})
         });
-        if (response.status < 200 || response.status >= 300) throw new GitHubError(response.status);
+        if (response.status < 200 || response.status >= 300) {
+            let detail;
+            try { detail = errorDetail(response.json?.message); } catch { /* The response can be plain text. */ }
+            throw new GitHubError(response.status, detail);
+        }
         return binary ? response.arrayBuffer : response.json;
     }
 
@@ -170,13 +179,22 @@ export class GitHub {
             message: "Sync vault files", tree: checkedOid(tree.sha), parents: [snapshot.head]
         });
         const after = checkedOid(commit.sha);
-        const result = await this.call("/graphql", "POST", {query: moveRef, variables: {input: {
-            repositoryId: snapshot.node,
-            refUpdates: [{name: "refs/heads/" + this.branch, beforeOid: snapshot.head, afterOid: after, force: false}]
-        }}});
-        if (!result.data?.updateRefs || result.errors?.length) {
-            if (await this.head() !== snapshot.head) throw new HeadMoved("Another device pushed first.");
-            throw new Error("GitHub could not update the branch. Check its rules and the token's Contents write permission.");
+        try {
+            const result = await this.call("/graphql", "POST", {query: moveRef, variables: {input: {
+                repositoryId: snapshot.node, clientMutationId: after,
+                refUpdates: [{name: "refs/heads/" + this.branch, beforeOid: snapshot.head, afterOid: after, force: false}]
+            }}});
+            if (!result?.data?.updateRefs || result.errors?.length) {
+                const reason = errorDetail(result?.errors?.[0]?.message);
+                throw new Error(reason ? "GitHub: " + reason : "GitHub did not confirm the branch update.");
+            }
+        } catch (error) {
+            // The ref write may have succeeded even if the response was lost.
+            let head;
+            try { head = await this.head(); } catch { throw error; }
+            if (head === after) return after;
+            if (head !== snapshot.head) throw new HeadMoved("Another device pushed first.");
+            throw error;
         }
         return after;
     }

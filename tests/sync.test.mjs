@@ -165,6 +165,41 @@ test("GitHub verifies raw blobs and conditionally moves exactly the expected Git
     assert.equal(await blobOid(buffer(data)), oid(data));
 });
 
+test("a missing ref update acknowledgement is reconciled against the actual GitHub branch", async t => {
+    const before = "a".repeat(40), after = "b".repeat(40), other = "c".repeat(40);
+    const refused = {status: 200, json: {errors: [{message: "Changes must be made through a pull request."}]}};
+    for (const [name, reply, current, expected] of [
+        ["lost response after success", new Error("offline"), after, null],
+        ["incomplete reply after success", {status: 200, json: {data: {updateRefs: null}}}, after, null],
+        ["earlier competing push", refused, other, HeadMoved],
+        ["rejected branch rule", refused, before, /through a pull request/],
+        ["ref and follow-up offline", new Error("could not reach GitHub"), null, /could not reach GitHub/]
+    ]) await t.test(name, async () => {
+        let headReads = 0, refWrites = 0;
+        const api = new GitHub({repository: "example/notes", branch: "main"}, "test", async req => {
+            if (req.url.endsWith("/graphql")) {
+                refWrites++;
+                const input = JSON.parse(req.body).variables.input;
+                assert.equal(input.clientMutationId, after);
+                assert.deepEqual(input.refUpdates, [{name: "refs/heads/main", beforeOid: before, afterOid: after, force: false}]);
+                if (reply instanceof Error) throw reply;
+                return reply;
+            }
+            if (req.url.includes("/git/ref/")) {
+                headReads++;
+                if (!current) throw new Error("second network failure");
+                return {status: 200, json: {ref: "refs/heads/main", object: {sha: current}}};
+            }
+            return {status: 201, json: {sha: after}};
+        }, () => "");
+        const operation = api.commit({tree: before, head: before, node: "fixture"}, []);
+        if (expected) await assert.rejects(operation, expected);
+        else assert.equal(await operation, after);
+        assert.equal(headReads, 1);
+        assert.equal(refWrites, 1);
+    });
+});
+
 test("a new empty branch downloads first, then creates an initial commit from a real vault file", async t => {
     const [remote, local] = await setup(t);
     let initialized = false;
