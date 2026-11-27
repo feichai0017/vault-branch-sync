@@ -1,7 +1,7 @@
 {
   "id": "vault-branch-sync",
   "name": "Vault Branch Sync",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "minAppVersion": "1.11.4",
   "description": "Sync notes and attachments with a private GitHub branch on desktop and mobile, and keep both copies when edits conflict.",
   "author": "feichai0017",
